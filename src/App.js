@@ -2,12 +2,13 @@ import React from "react";
 import useWallet from "./hooks/useWallet";
 import BridgeButton from "./components/BridgeButton";
 import { LogOut } from "lucide-react";
-
+import { Analytics } from "@vercel/analytics/react"
 function App() {
   const { address, connect, disconnect, signer } = useWallet();
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-50 font-sans px-6">
+       <Analytics/>
       <div className="w-full max-w-2xl bg-white rounded-2xl shadow p-6">
         <h1 className="text-3xl font-extrabold bg-gradient-to-r from-purple-500 to-pink-500 bg-clip-text text-transparent mb-8 text-center">
           LZ Bridge Custom
