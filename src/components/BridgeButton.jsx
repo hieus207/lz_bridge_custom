@@ -8,12 +8,13 @@ import SendParamsEditor from "./SendParamsEditor";
 const CHAINS = {
   Ethereum: 30101,
   BSC: 30102,
-  Polygon: 30103,
-  Arbitrum: 30104,
-  Optimism: 30105,
+  Polygon: 30109,
+  Arbitrum: 30110,
+  Optimism: 30111,
   Avalanche: 30106,
-  Fantom: 30107,
-  CoreDAO: 30108,
+  Sonic: 30332,
+  Base: 30184,
+  Solana: 30168,
   Custom: null,
 };
 
@@ -98,12 +99,12 @@ const BridgeButton = ({ signer }) => {
   const handleCheck = async () => {
     try {
       if (!ethers.isAddress(oftAddress)) {
-        setAlert({ type: "error", message: "Contract address không hợp lệ!" });
+        setAlert({ type: "error", message: "Invalid contract address!" });
         setOftContract(null)
         return;
       }
       if (!provider) {
-        setAlert({ type: "error", message: "Provider chưa sẵn sàng" });
+        setAlert({ type: "error", message: "Provider not found, Try reconect or use custom RPC" });
         setOftContract(null)
         return;
       }
@@ -113,7 +114,7 @@ const BridgeButton = ({ signer }) => {
 
       const code = await provider.getCode(oftAddress);
       if (code === "0x") {
-        setAlert({ type: "error", message: "Contract không tồn tại trên chain này!" });
+        setAlert({ type: "error", message: "Contract does not exist on this chain!" });
         setOftContract(null)
         return;
       }
@@ -192,11 +193,11 @@ const BridgeButton = ({ signer }) => {
   const handleBridge = async () => {
     try {
       if (!ethers.isAddress(oftAddress)) {
-        setAlert({ type: "error", message: "Contract address không hợp lệ" });
+        setAlert({ type: "error", message: "Invalid contract address" });
         return;
       }
       if (!provider) {
-        setAlert({ type: "error", message: "Provider chưa sẵn sàng" });
+        setAlert({ type: "error", message: "Provider not found, Try reconect or use custom RPC" });
         return;
       }
       const readOnlyContract = new ethers.Contract(oftAddress, oftAbi, provider);
@@ -214,11 +215,11 @@ const BridgeButton = ({ signer }) => {
       // await tx.wait();
       const receipt = await tx.wait();
       if (receipt.status === 1) {
-      setAlert({ type: "success", message: `Bridge thành công! <a class='underline underline-offset-2' target='_blank' href='https://layerzeroscan.com/tx/${tx.hash}'>${tx.hash.substring(0,10)}...</a>` });
+      setAlert({ type: "success", message: `Bridge success! <a class='underline underline-offset-2' target='_blank' href='https://layerzeroscan.com/tx/${tx.hash}'>${tx.hash.substring(0,10)}...</a>` });
       } else {
         setAlert({
           type: "error",
-          message: `Transaction thất bại! TxHash: ${tx.hash}`,
+          message: `Transaction failed! TxHash: ${tx.hash}`,
         });
       }
     } catch (err) {
