@@ -2,16 +2,17 @@ const SendParamsEditor = ({
   CHAINS,
   dstChain,
   setDstChain,
-  dstEidValue,
-  setDstEidValue,
   sendParams,
   setSendParams,
 }) => {
   return (
     <div className="bg-gray-50 border p-3 rounded-lg flex flex-col gap-2 text-sm">
       {/* Dòng tiêu đề chỉnh to và căn giữa */}
-      <div className="font-semibold text-center text-lg">Send Params (customizable)</div>
+      <div className="font-semibold text-center text-lg">
+        Send Params (customizable)
+      </div>
 
+      {/* dstEid (Chain) */}
       <div className="flex gap-2 items-center">
         <label className="w-28 font-medium">dstEid (Chain):</label>
         <select
@@ -19,25 +20,31 @@ const SendParamsEditor = ({
           value={dstChain}
           onChange={(e) => {
             const chain = e.target.value;
+            const newVal = CHAINS[chain] ?? sendParams.dstEid;
             setDstChain(chain);
-            setDstEidValue(CHAINS[chain] ?? dstEidValue);
+            setSendParams((prev) => ({ ...prev, dstEid: newVal }));
           }}
         >
           {Object.keys(CHAINS).map((c) => (
-            <option key={c} value={c}>{c}</option>
+            <option key={c} value={c}>
+              {c}
+            </option>
           ))}
+          <option value="Custom">Custom</option>
         </select>
+
         <input
           type="number"
-          value={dstEidValue ?? ""}
+          value={sendParams.dstEid ?? ""}
           onChange={(e) => {
-            setDstEidValue(e.target.value);
+            setSendParams((prev) => ({ ...prev, dstEid: e.target.value }));
             setDstChain("Custom");
           }}
           className="border px-2 py-1 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-400"
         />
       </div>
 
+      {/* Các param khác */}
       {Object.entries(sendParams).map(([key, value]) => {
         if (key === "dstEid") return null;
         return (

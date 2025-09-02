@@ -204,8 +204,17 @@ const BridgeButton = ({ signer }) => {
       const contract = new ethers.Contract(oftAddress, oftAbi, signer);
       const recipient = await signer.getAddress();
 
+      console.log(sendParams);
+      try {
+        const fee1 = await readOnlyContract.quoteSend(sendParams, false);
+        console.log("Quoted Fee:", fee1);
+        
+      } catch (error) {
+        console.error("Error quoting fee:", error);
+      }
       const fee = await readOnlyContract.quoteSend(sendParams, false);
-
+      console.log("Quoted Fee:", fee);
+      
       const tx = await contract.send(
         sendParams,
         { nativeFee: fee.nativeFee, lzTokenFee: fee.lzTokenFee },
