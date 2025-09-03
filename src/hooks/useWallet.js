@@ -1,30 +1,61 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { ethers } from "ethers";
 
-const useWallet = () => {
-  const [provider, setProvider] = useState(null);
-  const [signer, setSigner] = useState(null);
+function useWallet() {
   const [address, setAddress] = useState(null);
+  const [signer, setSigner] = useState(null);
 
+  // Hàm connect
   const connect = async () => {
-    if (!window.ethereum) throw new Error("No wallet found!");
-    const prov = new ethers.BrowserProvider(window.ethereum);
-    await prov.send("eth_requestAccounts", []);
-    const signer = await prov.getSigner();
-    const addr = await signer.getAddress();
+    if (window.ethereum) {
+      try {
+        const provider = new ethers.BrowserProvider(window.ethereum);
+        await provider.send("eth_requestAccounts", []);
+        const signer = await provider.getSigner();
+        const addr = await signer.getAddress();
 
-    setProvider(prov);
-    setSigner(signer);
-    setAddress(addr);
+        setAddress(addr);
+        setSigner(signer);
+
+        // Lưu trạng thái đã kết nối
+        localStorage.setItem("isWalletConnected", "true");
+      } catch (err) {
+        console.error("Wallet connect error:", err);
+      }
+    } else {
+      alert("Please install MetaMask!");
+    }
   };
 
+  // Hàm disconnect
   const disconnect = () => {
-    setProvider(null);
-    setSigner(null);
     setAddress(null);
+    setSigner(null);
+    localStorage.removeItem("isWalletConnected");
   };
 
-  return { provider, signer, address, connect, disconnect };
-};
+  // Auto reconnect khi F5
+  useEffect(() => {
+    const autoConnect = async () => {
+      if (localStorage.getItem("isWalletConnected") === "true" && window.ethereum) {
+        try {
+          const provider = new ethers.BrowserProvider(window.ethereum);
+          const signer = await provider.getSigner();
+          const addr = await signer.getAddress();
+
+          setAddress(addr);
+          setSigner(signer);
+        } catch (err) {
+          console.error("Auto connect failed:", err);
+          localStorage.removeItem("isWalletConnected");
+        }
+      }
+    };
+
+    autoConnect();
+  }, []);
+
+  return { address, signer, connect, disconnect };
+}
 
 export default useWallet;

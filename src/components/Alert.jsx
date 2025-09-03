@@ -84,7 +84,7 @@ const Alert = ({ type = "info", message, onClose, duration = 10000 }) => {
           />
         </svg>
       ),
-      linkClass: "text-blue-700 underline hover:text-blue-900",
+      linkClass: "text-blue-700 hover:text-blue-900",
     },
   };
 
