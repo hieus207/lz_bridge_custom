@@ -18,16 +18,6 @@ const CHAINS = {
   Custom: null,
 };
 
-const CHAIN_NAMES = {
-  1: "Ethereum",
-  56: "BNB",
-  137: "Polygon",
-  43114: "Avalanche",
-  42161: "Arbitrum",
-  10: "Optimism",
-  8453: "Base",
-};
-
 const SUPPORTED_CHAINS = {
   1: { name: "Ethereum", hex: "0x1" },
   56: { name: "BNB", hex: "0x38" },
@@ -265,7 +255,7 @@ const applyRpc = async () => {
       }
 
       const network = await provider.getNetwork();
-      setCurrentChain(CHAIN_NAMES[Number(network.chainId)] || `ChainId ${network.chainId}`);
+      setCurrentChain(SUPPORTED_CHAINS[Number(network.chainId)]?.name || `ChainId ${network.chainId}`);
 
       const code = await provider.getCode(oftAddress);
       if (code === "0x") {
@@ -491,7 +481,11 @@ const applyRpc = async () => {
       value={currentChainId}
       onChange={(e) => {
         const chain = SUPPORTED_CHAINS[e.target.value];
-        if (chain) switchChain(chain.hex);
+        if (chain) {
+          switchChain(chain.hex);
+        } else {
+          setAlert({ type: "info", message: `Custom chain selected: ${e.target.value}` });
+        }
       }}
       className="border px-2 py-1 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-400 font-bold text-blue-600"
     >
@@ -500,6 +494,13 @@ const applyRpc = async () => {
           {chain.name}
         </option>
       ))}
+
+      {/* ✅ Nếu chain hiện tại không có trong SUPPORTED_CHAINS thì thêm option Custom */}
+      {!SUPPORTED_CHAINS[currentChainId] && (
+        <option value={currentChainId} className="font-bold">
+          Custom (ChainId {currentChainId})
+        </option>
+      )}
     </select>
   </div>
 )}
