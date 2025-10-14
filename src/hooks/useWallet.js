@@ -4,42 +4,66 @@ import { ethers } from "ethers";
 function useWallet() {
   const [address, setAddress] = useState(null);
   const [signer, setSigner] = useState(null);
+  const [walletType, setWalletType] = useState(null); // "metamask" hoặc "okx"
 
-  // Hàm connect
-  const connect = async () => {
-    if (window.ethereum) {
-      try {
-        const provider = new ethers.BrowserProvider(window.ethereum);
-        await provider.send("eth_requestAccounts", []);
-        const signer = await provider.getSigner();
-        const addr = await signer.getAddress();
+  // ==== CHỌN PROVIDER ====
+const getProvider = (type = null) => {
+  if (window.ethereum?.providers) {
+    const okx = window.ethereum.providers.find((p) => p.isOkxWallet);
+    const metamask = window.ethereum.providers.find((p) => p.isMetaMask);
+    if (type === "okx" && okx) return okx;
+    if (type === "metamask" && metamask) return metamask;
+    if (okx) return okx;
+    if (metamask) return metamask;
+  }
+  if (window.okxwallet && (!type || type === "okx")) return window.okxwallet;
+  if (window.ethereum) return window.ethereum;
+  return null;
+};
 
-        setAddress(addr);
-        setSigner(signer);
+  // ==== CONNECT ====
+  const connect = async (type = null) => {
+    const providerObj = getProvider(type);
+    if (!providerObj) {
+      alert("Please install MetaMask or OKX Wallet!");
+      return;
+    }
 
-        // Lưu trạng thái đã kết nối
-        localStorage.setItem("isWalletConnected", "true");
-      } catch (err) {
-        console.error("Wallet connect error:", err);
-      }
-    } else {
-      alert("Please install MetaMask!");
+    try {
+      const provider = new ethers.BrowserProvider(providerObj);
+      await provider.send("eth_requestAccounts", []);
+      const signer = await provider.getSigner();
+      const addr = await signer.getAddress();
+
+      setAddress(addr);
+      setSigner(signer);
+      localStorage.setItem("isWalletConnected", "true");
+      localStorage.setItem("walletType", walletType || type);
+    } catch (err) {
+      console.error("Wallet connect error:", err);
     }
   };
 
-  // Hàm disconnect
+
+  // ==== DISCONNECT ====
   const disconnect = () => {
     setAddress(null);
     setSigner(null);
+    setWalletType(null);
     localStorage.removeItem("isWalletConnected");
+    localStorage.removeItem("walletType");
   };
 
-  // Auto reconnect khi F5
+  // ==== AUTO CONNECT ====
   useEffect(() => {
     const autoConnect = async () => {
-      if (localStorage.getItem("isWalletConnected") === "true" && window.ethereum) {
+      if (
+        localStorage.getItem("isWalletConnected") === "true" &&
+        (window.ethereum || window.okxwallet)
+      ) {
         try {
-          const provider = new ethers.BrowserProvider(window.ethereum);
+          const providerObj = getProvider();
+          const provider = new ethers.BrowserProvider(providerObj);
           const signer = await provider.getSigner();
           const addr = await signer.getAddress();
 
@@ -55,7 +79,7 @@ function useWallet() {
     autoConnect();
   }, []);
 
-  return { address, signer, connect, disconnect };
+  return { address, signer, walletType, connect, disconnect };
 }
 
 export default useWallet;
