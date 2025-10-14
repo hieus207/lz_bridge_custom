@@ -46,7 +46,7 @@ const BridgeButton = ({ signer }) => {
   const [currentChainId, setCurrentChainId] = useState(null);
   const [alert, setAlert] = useState(null);
   const [autoCheck, setAutoCheck] = useState(false);
-  
+  const [isCustomRpc, setIsCustomRpc] = useState(false);
 
   const [approvalRequired, setApprovalRequired] = useState(false); // mặc định true
   const [needsApproval, setNeedsApproval] = useState(false);
@@ -305,17 +305,19 @@ const applyRpc = async () => {
       }
 
       setInfo({ tokenAddress, name, symbol, version, decimals });
-
+      const params = new URLSearchParams(window.location.search);
       const recipient = await signer.getAddress();
-      const dstEid = Number(dstEidValue);
+      const dstEid = Number(params.get("dstEid")) ?? Number(dstEidValue);
+      const extraOptions = params.get("extraOp") ?? "0x";
+
       const amountWei = ethers.parseUnits(amount, decimals);
 
       setSendParams({
-        dstEid,
+        dstEid: dstEid,
         to: ethers.zeroPadValue(recipient, 32),
         amountLD: amountWei.toString(),
         minAmountLD: amountWei.toString(),
-        extraOptions: "0x",
+        extraOptions: extraOptions,
         composeMsg: "0x",
         oftCmd: "0x",
       });
@@ -452,24 +454,58 @@ const applyRpc = async () => {
   />
   Use custom RPC
 </label>
-
 {useCustomRpc && (
-  <div className="flex gap-2 items-center">
+  <div className="flex flex-col gap-2">
+    <div className="flex gap-2 items-center">
+<select
+  value={isCustomRpc ? "custom" : tempRpcUrl || "default"}
+  onChange={(e) => {
+    const val = e.target.value;
+    if (val === "custom") {
+      setIsCustomRpc(true);
+      setTempRpcUrl("");
+    } else {
+      setIsCustomRpc(false);
+      setTempRpcUrl(val);
+    }
+  }}
+  className="flex-1 border px-2 py-1 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-400"
+>
+  <option value="default">-- Select RPC --</option>
+  <option value="https://eth.rpc.blxrbdn.com">Ethereum (blxrdn)</option>
+  <option value="https://bsc-dataseed.binance.org/">BNB Chain</option>
+  <option value="https://polygon-rpc.com">Polygon</option>
+  <option value="https://arb1.arbitrum.io/rpc">Arbitrum</option>
+  <option value="https://mainnet.optimism.io">Optimism</option>
+  <option value="https://api.avax.network/ext/bc/C/rpc">Avalanche</option>
+  <option value="https://base-rpc.publicnode.com">Base</option>
+  <option value="custom">➕ Custom (enter manually)</option>
+</select>
+
+
+      <button
+        onClick={() => applyRpc()}
+        className="px-3 py-1 bg-blue-500 text-white rounded hover:bg-blue-600"
+      >
+        Apply
+      </button>
+    </div>
+
+    {/* Chỉ hiện ô nhập khi chọn custom */}
+  {isCustomRpc && (
     <input
       type="text"
       placeholder="Enter custom RPC URL"
       value={tempRpcUrl}
       onChange={(e) => setTempRpcUrl(e.target.value)}
-      className="flex-1 border px-2 py-1 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-400"
+      className="w-full border px-2 py-1 rounded-lg focus:outline-none focus:ring-1 focus:ring-blue-400"
     />
-    <button
-      onClick={() => applyRpc()}
-      className="px-3 py-1 bg-blue-500 text-white rounded hover:bg-blue-600"
-    >
-      Apply
-    </button>
+  )}
   </div>
 )}
+
+
+
 <div className="mt-3 p-3 rounded-lg border border-yellow-300 bg-yellow-50 text-yellow-800 flex flex-col gap-2 shadow-sm">
   <span className="font-semibold">
     This is a custom bridge based on the token’s LayerZero OFT contract, not an official bridge for any token via LayerZero. Test with a small amount first and take responsibility for your transactions!
@@ -534,7 +570,7 @@ const applyRpc = async () => {
               {/* nút share */}
 <button
   onClick={() => {
-    const url = `${window.location.origin}${window.location.pathname}?oftadr=${oftAddress}&chainId=${currentChainId}&auto=true`;
+    const url = `${window.location.origin}${window.location.pathname}?oftadr=${oftAddress}&chainId=${currentChainId}&auto=true&dstEid=${sendParams?.dstEid || dstEidValue}&extraOp=${sendParams?.extraOptions || "0x"}`;
     navigator.clipboard.writeText(url);
     setAlert({ type: "success", message: "Copied share URL!" });
   }}
