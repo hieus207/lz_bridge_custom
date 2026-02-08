@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Connection, PublicKey } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
 
 export default function useSolanaWallet() {
   const [address, setAddress] = useState(null);

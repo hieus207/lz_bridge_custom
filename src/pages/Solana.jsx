@@ -102,6 +102,7 @@ function SolanaPage() {
 
   React.useEffect(() => {
     fetchLaunchInfo();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   React.useEffect(() => {
@@ -112,6 +113,7 @@ function SolanaPage() {
     }, refreshInterval * 1000);
 
     return () => clearInterval(intervalId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoRefresh, refreshInterval]);
 
 React.useEffect(() => {

@@ -28,7 +28,7 @@ const NexusButton = ({ signer }) => {
   const [nexusAddress, setNexusAddress] = useState("");
   const [amount, setAmount] = useState("5");
   const [dstChain, setDstChain] = useState("Ethereum");
-  const [dstChainId, setDstChainId] = useState(CHAINS[dstChain]);
+  // const [dstChainId, setDstChainId] = useState(CHAINS[dstChain]);
   const [recipientAddress, setRecipientAddress] = useState("");
   const [useCustomRpc, setUseCustomRpc] = useState(false);
   const [customRpcUrl, setCustomRpcUrl] = useState("");
@@ -134,7 +134,7 @@ const NexusButton = ({ signer }) => {
 
   // Update dst chain ID and params
   useEffect(() => {
-    setDstChainId(CHAINS[dstChain]);
+    // setDstChainId(CHAINS[dstChain]);
     setNexusParams((prev) => ({ ...prev, destination: CHAINS[dstChain] }));
   }, [dstChain]);
 

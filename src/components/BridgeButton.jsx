@@ -42,7 +42,7 @@ const BridgeButton = ({ signer }) => {
   const [customRpcUrl, setCustomRpcUrl] = useState("");
   const [tempRpcUrl, setTempRpcUrl] = useState("");
   const [provider, setProvider] = useState(null);
-  const [currentChain, setCurrentChain] = useState(null);
+  // const [currentChain, setCurrentChain] = useState(null);
   const [currentChainId, setCurrentChainId] = useState(null);
   const [alert, setAlert] = useState(null);
   const [autoCheck, setAutoCheck] = useState(false);
@@ -88,6 +88,7 @@ useEffect(() => {
     
     setAutoCheck(false); // chỉ auto check 1 lần thôi
   }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
 }, [oftAddress, currentChainId, provider,autoCheck]);
 
   useEffect(() => {
@@ -103,7 +104,7 @@ useEffect(() => {
       });
     }
   }
-}, [provider]);
+}, [provider, useCustomRpc]);
   // Apply RPC
 const applyRpc = async () => {
   if (tempRpcUrl.trim() !== "") {
@@ -255,7 +256,7 @@ const applyRpc = async () => {
       }
 
       const network = await provider.getNetwork();
-      setCurrentChain(SUPPORTED_CHAINS[Number(network.chainId)]?.name || `ChainId ${network.chainId}`);
+      // setCurrentChain(SUPPORTED_CHAINS[Number(network.chainId)]?.name || `ChainId ${network.chainId}`);
 
       const code = await provider.getCode(oftAddress);
       if (code === "0x") {
@@ -407,6 +408,7 @@ const applyRpc = async () => {
     if (approvalRequired && info?.tokenAddress && ethers.isAddress(info.tokenAddress) && oftAddress) {
       checkApproval(info.tokenAddress, oftAddress, amount, info.decimals || 18);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [amount, info, approvalRequired]);
 
   useEffect(() => {
@@ -424,6 +426,7 @@ const applyRpc = async () => {
   } catch (err) {
     console.error("Failed to parse amount:", err);
   }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
 }, [amount, info?.decimals]);
 
   return (
