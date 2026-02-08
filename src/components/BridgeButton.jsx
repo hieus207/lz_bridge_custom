@@ -255,7 +255,7 @@ const applyRpc = async () => {
         return;
       }
 
-      const network = await provider.getNetwork();
+      // const network = await provider.getNetwork();
       // setCurrentChain(SUPPORTED_CHAINS[Number(network.chainId)]?.name || `ChainId ${network.chainId}`);
 
       const code = await provider.getCode(oftAddress);
