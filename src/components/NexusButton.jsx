@@ -389,8 +389,22 @@ const NexusButton = ({ signer }) => {
       return;
     }
 
-    // Recreate contract with fresh signer (signer always has latest provider)
-    const contractWithSigner = new ethers.Contract(nexusAddress, nexusAbi, signer);
+    // Recreate provider to ensure correct chain (same as handleCheck)
+    let currentProvider;
+    if (useCustomRpc && customRpcUrl) {
+      currentProvider = new ethers.JsonRpcProvider(customRpcUrl);
+    } else if (window.ethereum) {
+      currentProvider = new ethers.BrowserProvider(window.ethereum);
+    } else {
+      setAlert({ type: "error", message: "No provider available" });
+      return;
+    }
+
+    // Get fresh signer from new provider
+    const freshSigner = await currentProvider.getSigner();
+
+    // Recreate contract with fresh signer on current chain
+    const contractWithSigner = new ethers.Contract(nexusAddress, nexusAbi, freshSigner);
 
     if (!nexusParams.amount || nexusParams.amount === "0") {
       setAlert({ type: "error", message: "Invalid amount!" });
@@ -417,17 +431,44 @@ const NexusButton = ({ signer }) => {
       setLoading(true);
 
       // Verify network before proceeding
-      const signerNetwork = await signer.provider.getNetwork();
-      console.log("Current signer network:", signerNetwork.chainId.toString());
+      const signerNetwork = await currentProvider.getNetwork();
+      const currentChainId = signerNetwork.chainId.toString();
+      console.log("Current signer network:", currentChainId);
+
+      // Verify contract exists on current chain
+      const code = await currentProvider.getCode(nexusAddress);
+      if (code === "0x") {
+        setAlert({ 
+          type: "error", 
+          message: `❌ Contract ${nexusAddress.slice(0, 10)}... does not exist on chain ${currentChainId}! Please check contract address.` 
+        });
+        setLoading(false);
+        return;
+      }
+
+      // Log params for debugging
+      console.log("Calling quoteTransferRemote with:");
+      console.log("- Contract:", nexusAddress);
+      console.log("- Destination:", nexusParams.destination);
+      console.log("- Recipient:", nexusParams.recipient);
+      console.log("- Amount:", nexusParams.amount);
 
       // Step 1: Quote fee using fresh contract
       setAlert({ type: "info", message: "🔍 Quoting fee..." });
       
-      const quotes = await contractWithSigner.quoteTransferRemote(
-        nexusParams.destination,
-        nexusParams.recipient,
-        nexusParams.amount
-      );
+      let quotes;
+      try {
+        quotes = await contractWithSigner.quoteTransferRemote(
+          nexusParams.destination,
+          nexusParams.recipient,
+          nexusParams.amount
+        );
+      } catch (quoteError) {
+        console.error("Quote error details:", quoteError);
+        throw new Error(
+          `Failed to quote: ${quoteError.message}. This contract may not support quoteTransferRemote on chain ${currentChainId}, or params are invalid.`
+        );
+      }
 
       console.log("Quote result:", quotes);
 
