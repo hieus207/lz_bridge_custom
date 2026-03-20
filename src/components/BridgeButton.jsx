@@ -91,7 +91,7 @@ const CUSTOM_RPC_INDEX = 4;
 
 const BridgeButton = ({ signer, address, disconnect }) => {
   const [oftAddress, setOftAddress] = useState("");
-  const [amount, setAmount] = useState("5");
+  const [amount, setAmount] = useState("0");
   const [info, setInfo] = useState(null);
   const [sendParams, setSendParams] = useState(null);
   const [dstChain, setDstChain] = useState("Ethereum");
@@ -145,6 +145,13 @@ const BridgeButton = ({ signer, address, disconnect }) => {
   const [showSavedRoutes, setShowSavedRoutes] = useState(false);
   const [setupCollapsed, setSetupCollapsed] = useState(false);
   // const [showOftScanner, setShowOftScanner] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [autoBalanceEnabled, setAutoBalanceEnabled] = useState(() => localStorage.getItem("lz_auto_balance") !== "false");
+  const [autoBalanceInterval, setAutoBalanceInterval] = useState(() => {
+    const saved = parseInt(localStorage.getItem("lz_auto_balance_sec"), 10);
+    return isNaN(saved) ? 10 : saved;
+  });
+  const [balanceLoading, setBalanceLoading] = useState(false);
 
 useEffect(() => {
   const params = new URLSearchParams(window.location.search);
@@ -175,15 +182,19 @@ useEffect(() => {
 useEffect(() => {
   if (oftAddress && currentChainId && provider && autoCheck) {
     console.log(autoCheck);
-    handleCheck(oftAddress, currentChainId);
-    setAutoCheck(false);
+    // Small delay to ensure provider is fully ready after chain switch
+    const timer = setTimeout(() => {
+      handleCheck(oftAddress, currentChainId);
+      setAutoCheck(false);
+    }, 300);
+    return () => clearTimeout(timer);
   }
   // eslint-disable-next-line react-hooks/exhaustive-deps
 }, [oftAddress, currentChainId, provider, autoCheck]);
 
   // Reset to before-check when chain changes so user can re-verify
   useEffect(() => {
-    if (info && currentChainId) {
+    if (info && currentChainId && !autoCheck) {
       setInfo(null);
       setOftContract(null);
       setSendParams(null);
@@ -200,6 +211,17 @@ useEffect(() => {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentChainId]);
+
+  // Auto-refresh balance interval
+  useEffect(() => {
+    if (!autoBalanceEnabled || !info?.tokenAddress || info?.decimals == null || !provider || !signer) return;
+    const ms = (autoBalanceInterval || 10) * 1000;
+    const id = setInterval(() => {
+      refreshBalance(info.tokenAddress, info.decimals);
+    }, ms);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoBalanceEnabled, autoBalanceInterval, info, provider, signer]);
 
   // Chain changed → reset info and auto re-check is handled below
 
@@ -389,10 +411,28 @@ const tryWithFallback = async (chainId, fn) => {
     }
   }
 
+  const refreshBalance = async (tokenAddr, decimals) => {
+    try {
+      setBalanceLoading(true);
+      const signerAddr = await signer.getAddress();
+      if (ethers.isAddress(tokenAddr)) {
+        const token = new ethers.Contract(tokenAddr, oftAbi, provider);
+        const bal = await token.balanceOf(signerAddr);
+        setBalance(ethers.formatUnits(bal, decimals));
+      }
+    } catch {
+      // silently fail
+    } finally {
+      setBalanceLoading(false);
+    }
+  };
+
   const handleCheck = async () => {
     try {
       setChecking(true);
-      console.log("goi handle check");
+      setInfo(null);
+      setSendParams(null);
+      setBalance("0");
       
       if (!ethers.isAddress(oftAddress)) {
         setAlert({ type: "error", message: "Invalid contract address!" });
@@ -469,16 +509,7 @@ const tryWithFallback = async (chainId, fn) => {
       setInfo({ tokenAddress, name, symbol, version, decimals });
 
       // Fetch balance
-      try {
-        const signerAddr = await signer.getAddress();
-        if (ethers.isAddress(tokenAddress)) {
-          const token = new ethers.Contract(tokenAddress, oftAbi, provider);
-          const bal = await token.balanceOf(signerAddr);
-          setBalance(ethers.formatUnits(bal, decimals));
-        }
-      } catch {
-        setBalance("0");
-      }
+      await refreshBalance(tokenAddress, decimals);
 
       const params = new URLSearchParams(window.location.search);
       const recipient = await signer.getAddress();
@@ -558,6 +589,10 @@ const tryWithFallback = async (chainId, fn) => {
       const receipt = await tx.wait();
       if (receipt.status === 1) {
       setAlert({ type: "success", message: `Bridge success! <a class='underline underline-offset-2' target='_blank' href='https://layerzeroscan.com/tx/${tx.hash}'>${tx.hash.substring(0,10)}...</a>` });
+      // Reload balance after successful bridge
+      if (info?.tokenAddress && info?.decimals != null) {
+        setTimeout(() => refreshBalance(info.tokenAddress, info.decimals), 2000);
+      }
       } else {
         setAlert({
           type: "error",
@@ -750,6 +785,16 @@ const tryWithFallback = async (chainId, fn) => {
           <h2 className="text-lg font-bold text-gray-900">Setup Bridge</h2>
           <div className="flex items-center gap-2">
             <button
+              onClick={() => setShowSettings(true)}
+              className="p-1 rounded-lg hover:bg-gray-100 transition text-gray-400 hover:text-gray-600"
+              title="Settings"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 010 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 010-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.086.22-.128.332-.183.582-.495.644-.869l.214-1.28z" />
+                <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+              </svg>
+            </button>
+            <button
               onClick={() => setSetupCollapsed(true)}
               className="p-1 rounded-lg hover:bg-gray-100 transition text-gray-400 hover:text-gray-600"
               title="Collapse panel"
@@ -769,6 +814,8 @@ const tryWithFallback = async (chainId, fn) => {
             </div>
           </div>
         </div>
+
+        {/* Settings panel is now a modal — rendered at bottom of component */}
 
         {/* Source chain — compact */}
         <div>
@@ -1130,7 +1177,16 @@ const tryWithFallback = async (chainId, fn) => {
             <div>
               <div className="flex items-center justify-between mb-2">
                 <p className="text-sm text-gray-500">Amount to bridge</p>
-                <p className="text-sm text-gray-500">Balance: <span className="font-semibold text-gray-800">{balance}</span></p>
+                <p className="text-sm text-gray-500 flex items-center gap-1">Balance: {balanceLoading ? (
+                  <svg className="animate-spin h-4 w-4 text-green-500 inline" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"/></svg>
+                ) : (
+                  <span className="font-semibold text-gray-800">{balance}</span>
+                )}
+                {info && !balanceLoading && (
+                  <button onClick={() => refreshBalance(info.token, info.decimals)} title="Refresh balance" className="ml-1 text-green-500 hover:text-green-700 transition">
+                    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h5M20 20v-5h-5M5.6 15.4A8 8 0 0118.4 8.6M18.4 8.6A8 8 0 015.6 15.4"/></svg>
+                  </button>
+                )}</p>
               </div>
               <div className="border border-gray-200 rounded-xl p-4">
                 <input
@@ -1317,6 +1373,68 @@ const tryWithFallback = async (chainId, fn) => {
       />
       */}
 
+      {/* Settings Modal */}
+      {showSettings && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setShowSettings(false)}>
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm mx-4 flex flex-col" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
+              <h3 className="text-lg font-bold text-gray-900">Settings</h3>
+              <button onClick={() => setShowSettings(false)} className="text-gray-400 hover:text-gray-600 transition">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-5 h-5">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="px-5 py-4 flex flex-col gap-4">
+              {/* Auto refresh balance */}
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-gray-600">Auto refresh balance</span>
+                <button
+                  onClick={() => {
+                    const next = !autoBalanceEnabled;
+                    setAutoBalanceEnabled(next);
+                    localStorage.setItem("lz_auto_balance", String(next));
+                  }}
+                  className={`w-10 h-[22px] rounded-full transition relative ${autoBalanceEnabled ? "bg-gray-800" : "bg-gray-300"}`}
+                >
+                  <span className={`absolute top-0.5 w-[18px] h-[18px] bg-white rounded-full shadow transition-transform ${autoBalanceEnabled ? "translate-x-[18px]" : "translate-x-0.5"}`} />
+                </button>
+              </div>
+              {autoBalanceEnabled && (
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-sm text-gray-400">Every</span>
+                  {[5, 10, 30].map(s => (
+                    <button
+                      key={s}
+                      onClick={() => {
+                        setAutoBalanceInterval(s);
+                        localStorage.setItem("lz_auto_balance_sec", String(s));
+                      }}
+                      className={`px-3 py-1 rounded-lg text-sm transition ${autoBalanceInterval === s ? "bg-gray-800 text-white" : "bg-white border border-gray-200 text-gray-500 hover:bg-gray-100"}`}
+                    >
+                      {s}s
+                    </button>
+                  ))}
+                  <input
+                    type="number"
+                    min="1"
+                    max="300"
+                    value={autoBalanceInterval}
+                    onChange={e => {
+                      const v = Math.max(1, Math.min(300, parseInt(e.target.value, 10) || 10));
+                      setAutoBalanceInterval(v);
+                      localStorage.setItem("lz_auto_balance_sec", String(v));
+                    }}
+                    className="w-16 px-2 py-1 border border-gray-200 rounded-lg text-sm text-center font-mono focus:outline-none focus:ring-1 focus:ring-gray-300"
+                  />
+                  <span className="text-sm text-gray-400">sec</span>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Saved Routes Modal */}
       {showSavedRoutes && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setShowSavedRoutes(false)}>
@@ -1378,6 +1496,8 @@ const tryWithFallback = async (chainId, fn) => {
                         }
                         setShowSavedRoutes(false);
                         setAlert({ type: "info", message: `Route loaded: ${route.name || route.symbol || route.oftAddress.slice(0,10)}` });
+                        setInfo(null);
+                        setChecking(true);
                         setAutoCheck(true);
                       }}
                     >
