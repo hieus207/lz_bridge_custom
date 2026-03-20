@@ -99,7 +99,18 @@ const BridgeButton = ({ signer, address, disconnect }) => {
   const [dstEidValue, setDstEidValue] = useState(CHAINS[dstChain]);
   const [useWalletRpc, setUseWalletRpc] = useState(() => localStorage.getItem("lz_use_wallet_rpc") === "true");
   const [provider, setProvider] = useState(null);
-  const [currentChainId, setCurrentChainId] = useState(null);
+  const [currentChainId, setCurrentChainIdRaw] = useState(() => {
+    try {
+      const saved = localStorage.getItem("lz_current_chain");
+      if (saved === "custom") return "custom";
+      const parsed = parseInt(saved, 10);
+      return isNaN(parsed) ? null : parsed;
+    } catch { return null; }
+  });
+  const setCurrentChainId = (v) => {
+    setCurrentChainIdRaw(v);
+    if (v != null) localStorage.setItem("lz_current_chain", String(v));
+  };
   const [alert, setAlert] = useState(null);
   const [autoCheck, setAutoCheck] = useState(false);
   const [balance, setBalance] = useState("0");
