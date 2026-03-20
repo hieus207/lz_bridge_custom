@@ -37,8 +37,9 @@ const getProvider = (type = null) => {
 
       setAddress(addr);
       setSigner(signer);
+      setWalletType(type);
       localStorage.setItem("isWalletConnected", "true");
-      localStorage.setItem("walletType", walletType || type);
+      localStorage.setItem("walletType", type);
     } catch (err) {
       console.error("Wallet connect error:", err);
     }
@@ -62,13 +63,15 @@ const getProvider = (type = null) => {
         (window.ethereum || window.okxwallet)
       ) {
         try {
-          const providerObj = getProvider();
+          const savedType = localStorage.getItem("walletType");
+          const providerObj = getProvider(savedType);
           const provider = new ethers.BrowserProvider(providerObj);
           const signer = await provider.getSigner();
           const addr = await signer.getAddress();
 
           setAddress(addr);
           setSigner(signer);
+          setWalletType(savedType);
         } catch (err) {
           console.error("Auto connect failed:", err);
           localStorage.removeItem("isWalletConnected");

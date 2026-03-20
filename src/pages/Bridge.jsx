@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import useWallet from "../hooks/useWallet";
 import BridgeButton from "../components/BridgeButton";
-import { LogOut, X } from "lucide-react";
+import { X } from "lucide-react";
 
 function Bridge() {
   const { address, connect, disconnect, signer } = useWallet();
@@ -13,82 +13,63 @@ function Bridge() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-50 font-sans px-6">
-      <div className="w-full max-w-2xl bg-white rounded-2xl shadow p-6">
-        <h1 className="text-3xl font-extrabold bg-gradient-to-r from-purple-500 to-pink-500 bg-clip-text text-transparent mb-8 text-center">
-          LZ Bridge Custom
-        </h1>
-
+    <div className="min-h-screen flex items-center justify-center bg-[#f5f0e6] font-sans px-4 py-8">
+      <div className="w-full max-w-4xl">
         {address ? (
-          <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <p className="text-gray-700 font-medium">
-                Wallet:{" "}
-                <span className="font-mono text-sm text-purple-600">
-                  {address}
-                </span>
-              </p>
-              <button
-                onClick={disconnect}
-                className="p-2 rounded-full hover:bg-gray-200 transition"
-                title="Disconnect"
-              >
-                <LogOut className="w-5 h-5 text-red-500" />
-              </button>
-            </div>
-            <BridgeButton signer={signer} />
-          </div>
+          <BridgeButton signer={signer} address={address} disconnect={disconnect} />
         ) : (
-          <>
+          <div className="w-full max-w-md mx-auto bg-white rounded-2xl shadow-lg overflow-hidden p-6">
+            <h1 className="text-xl font-bold text-gray-900 mb-6 text-center">LZ Bridge</h1>
             <button
               onClick={() => setShowModal(true)}
-              className="px-6 py-2 bg-yellow-400 text-black text-sm font-semibold rounded-xl shadow hover:bg-yellow-300 transition duration-200 mx-auto block"
+              className="w-full px-6 py-3 bg-gray-900 text-white text-sm font-semibold rounded-xl shadow hover:bg-gray-800 transition duration-200"
             >
               Connect Wallet
             </button>
-
-            {showModal && (
-              <div className="fixed inset-0 flex items-center justify-center bg-black bg-opacity-40 z-50">
-                <div className="bg-white rounded-xl shadow-lg p-6 w-80 relative">
-                  <button
-                    onClick={() => setShowModal(false)}
-                    className="absolute top-2 right-2 text-gray-500 hover:text-gray-700"
-                  >
-                    <X className="w-5 h-5" />
-                  </button>
-                  <h2 className="text-lg font-semibold mb-4 text-center">
-                    Chọn ví để kết nối
-                  </h2>
-                  <div className="space-y-3">
-                    <button
-                      onClick={() => handleConnect("metamask")}
-                      className="w-full flex items-center justify-center gap-2 border rounded-lg py-2 hover:bg-gray-100"
-                    >
-                      <img
-                        src="https://assets.pancakeswap.finance/web/wallets/metamask.png"
-                        alt="MetaMask"
-                        className="w-6 h-6"
-                      />
-                      <span className="font-medium">MetaMask</span>
-                    </button>
-                    <button
-                      onClick={() => handleConnect("okx")}
-                      className="w-full flex items-center justify-center gap-2 border rounded-lg py-2 hover:bg-gray-100"
-                    >
-                      <img
-                        src="https://assets.pancakeswap.finance/web/wallets/okx-wallet.png"
-                        alt="OKX"
-                        className="w-6 h-6"
-                      />
-                      <span className="font-medium">OKX Wallet</span>
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-          </>
+          </div>
         )}
       </div>
+
+      {/* Wallet selection modal */}
+      {showModal && (
+        <div className="fixed inset-0 flex items-center justify-center bg-black bg-opacity-40 z-50">
+          <div className="bg-white rounded-2xl shadow-lg p-6 w-80 relative">
+            <button
+              onClick={() => setShowModal(false)}
+              className="absolute top-3 right-3 text-gray-400 hover:text-gray-600"
+            >
+              <X className="w-5 h-5" />
+            </button>
+            <h2 className="text-lg font-semibold mb-4 text-center">
+              Chọn ví để kết nối
+            </h2>
+            <div className="space-y-3">
+              <button
+                onClick={() => handleConnect("metamask")}
+                className="w-full flex items-center justify-center gap-2 border border-gray-200 rounded-xl py-3 hover:bg-gray-50 transition"
+              >
+                <img
+                  src="https://assets.pancakeswap.finance/web/wallets/metamask.png"
+                  alt="MetaMask"
+                  className="w-6 h-6"
+                />
+                <span className="font-medium">MetaMask</span>
+              </button>
+              <button
+                onClick={() => handleConnect("okx")}
+                className="w-full flex items-center justify-center gap-2 border border-gray-200 rounded-xl py-3 hover:bg-gray-50 transition"
+              >
+                <img
+                  src="https://assets.pancakeswap.finance/web/wallets/okx-wallet.png"
+                  alt="OKX"
+                  className="w-6 h-6"
+                />
+                <span className="font-medium">OKX Wallet</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

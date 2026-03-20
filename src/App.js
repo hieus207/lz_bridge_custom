@@ -9,19 +9,19 @@ import Nexus from "./pages/Nexus";
 function App() {
   return (
     <Router>
-      <nav className="p-4 bg-gray-800 text-white flex gap-4">
-        {/* <Link to="/" className="hover:underline">
-          Dashboard
-        </Link> */}
-        <Link to="/bridge" className="hover:underline">
-          Bridge
-        </Link>
-        <Link to="/solana" className="hover:underline">
-          Solana
-        </Link>
-        <Link to="/nexus" className="hover:underline">
-          Nexus
-        </Link>
+      <nav className="px-6 py-3 bg-white border-b border-gray-100 flex items-center gap-6">
+        <span className="font-bold text-gray-900 text-sm tracking-tight">LZ Bridge</span>
+        <div className="flex gap-4">
+          <Link to="/bridge" className="text-sm text-gray-500 hover:text-gray-900 transition font-medium">
+            Bridge
+          </Link>
+          <Link to="/solana" className="text-sm text-gray-500 hover:text-gray-900 transition font-medium">
+            Solana
+          </Link>
+          <Link to="/nexus" className="text-sm text-gray-500 hover:text-gray-900 transition font-medium">
+            Nexus
+          </Link>
+        </div>
       </nav>
 
       <Routes>
