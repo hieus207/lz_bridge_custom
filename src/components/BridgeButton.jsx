@@ -4,6 +4,7 @@ import oftAbi from "../abis/OFT.json";
 import Alert from "./Alert";
 import SendParamsEditor from "./SendParamsEditor";
 import { LogOut } from "lucide-react";
+// import OftScanner from "./OftScanner";
 
 // CoinGecko platform ID mapping
 const CGC_PLATFORMS = {
@@ -132,6 +133,7 @@ const BridgeButton = ({ signer, address, disconnect }) => {
   });
   const [showSavedRoutes, setShowSavedRoutes] = useState(false);
   const [setupCollapsed, setSetupCollapsed] = useState(false);
+  // const [showOftScanner, setShowOftScanner] = useState(false);
 
 useEffect(() => {
   const params = new URLSearchParams(window.location.search);
@@ -869,6 +871,17 @@ const tryWithFallback = async (chainId, fn) => {
           >
             Verify Contract
           </button>
+          {/* OFT Scanner button — disabled temporarily
+          <button
+            onClick={() => setShowOftScanner(true)}
+            className="px-3 py-2.5 bg-gray-50 border border-gray-200 text-gray-600 font-semibold rounded-xl hover:bg-gray-100 transition text-sm flex items-center gap-1.5"
+            title="Scan for OFT contract from token holders"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
+            </svg>
+          </button>
+          */}
           <button
             onClick={() => setShowSavedRoutes(true)}
             className="px-3 py-2.5 bg-gray-50 border border-gray-200 text-gray-600 font-semibold rounded-xl hover:bg-gray-100 transition text-sm flex items-center gap-1.5"
@@ -1279,6 +1292,20 @@ const tryWithFallback = async (chainId, fn) => {
           </>
         )}
       </div>
+
+      {/* OFT Scanner Modal — disabled temporarily
+      <OftScanner
+        show={showOftScanner}
+        onClose={() => setShowOftScanner(false)}
+        onSelect={(addr) => {
+          setOftAddress(addr);
+          setAutoCheck(true);
+        }}
+        chainId={currentChainId}
+        provider={provider}
+        chainRpcs={CHAIN_RPCS}
+      />
+      */}
 
       {/* Saved Routes Modal */}
       {showSavedRoutes && (
