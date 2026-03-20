@@ -95,7 +95,7 @@ const BridgeButton = ({ signer, address, disconnect }) => {
   const [info, setInfo] = useState(null);
   const [sendParams, setSendParams] = useState(null);
   const [dstChain, setDstChain] = useState("Ethereum");
-  const [oftContract, setOftContract] = useState(null);
+  const [, setOftContract] = useState(null);
   const [dstEidValue, setDstEidValue] = useState(CHAINS[dstChain]);
   const [useWalletRpc, setUseWalletRpc] = useState(() => localStorage.getItem("lz_use_wallet_rpc") === "true");
   const [provider, setProvider] = useState(null);
@@ -449,7 +449,7 @@ const tryWithFallback = async (chainId, fn) => {
         return;
       }
 
-      const { tokenAddress, name, symbol, version, decimals, requireApprove, contract } = result;
+      const { tokenAddress, name, symbol, version, decimals, requireApprove } = result;
 
       // Re-create contract with current provider for state
       setOftContract(new ethers.Contract(oftAddress, oftAbi, provider));
@@ -687,7 +687,6 @@ const tryWithFallback = async (chainId, fn) => {
         setListingStatus("CGC listed");
         localStorage.setItem(cacheKey, "CGC listed");
         // Lấy link CoinGecko
-        const link = data?.links?.homepage?.[0] || `https://www.coingecko.com/en/coins/${data?.id || ""}`;
         const cgcUrl = `https://www.coingecko.com/en/coins/${data?.id || ""}`;
         setCgcLink(cgcUrl);
         localStorage.setItem(linkKey, cgcUrl);
