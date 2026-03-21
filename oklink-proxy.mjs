@@ -106,7 +106,35 @@ function fetchOklink(url) {
 
 // ── HTTP server ───────────────────────────────────────────────────────────
 // Route: GET /api/holders/:chain/:address
-const HOLDER_RE = /^\/api\/holders\/([^/]+)\/([^/?]+)/;
+// Route: GET /api/fetch-proxy?url=...
+const HOLDER_RE    = /^\/api\/holders\/([^/]+)\/([^/?]+)/;
+const FP_PATH      = "/api/fetch-proxy";
+
+const FETCH_PROXY_ALLOWED = [
+  "portalbridge.com",
+  "api.wormholescan.io",
+];
+
+function simpleFetch(urlStr) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(urlStr);
+    const lib = parsed.protocol === "https:" ? https : http;
+    const req2 = lib.request(
+      { hostname: parsed.hostname, path: parsed.pathname + parsed.search, method: "GET",
+        headers: { "User-Agent": "Mozilla/5.0", Accept: "*/*" } },
+      (res2) => {
+        if ((res2.statusCode === 301 || res2.statusCode === 302) && res2.headers.location) {
+          return simpleFetch(res2.headers.location).then(resolve).catch(reject);
+        }
+        const chunks = [];
+        res2.on("data", c => chunks.push(c));
+        res2.on("end", () => resolve({ status: res2.statusCode, body: Buffer.concat(chunks), contentType: res2.headers["content-type"] || "text/plain" }));
+      }
+    );
+    req2.on("error", reject);
+    req2.end();
+  });
+}
 
 const server = http.createServer(async (req, res) => {
   // CORS preflight
@@ -121,11 +149,43 @@ const server = http.createServer(async (req, res) => {
   }
 
   const reqUrl = new URL(req.url, `http://localhost:${PORT}`);
+
+  // ── /api/fetch-proxy?url=... ─────────────────────────────────────────
+  if (reqUrl.pathname === FP_PATH) {
+    const targetUrl = reqUrl.searchParams.get("url");
+    if (!targetUrl) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing ?url= parameter" }));
+      return;
+    }
+    let parsed2;
+    try { parsed2 = new URL(targetUrl); } catch {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid URL" }));
+      return;
+    }
+    const allowed = FETCH_PROXY_ALLOWED.some(h => parsed2.hostname === h || parsed2.hostname.endsWith("." + h));
+    if (!allowed) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Domain not allowed: " + parsed2.hostname }));
+      return;
+    }
+    try {
+      const { status, body, contentType } = await simpleFetch(targetUrl);
+      res.writeHead(status, { "Content-Type": contentType });
+      res.end(body);
+    } catch (err) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   const match  = HOLDER_RE.exec(reqUrl.pathname);
 
   if (!match) {
     res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Not found. Use /api/holders/:chain/:address" }));
+    res.end(JSON.stringify({ error: "Not found. Use /api/holders/:chain/:address or /api/fetch-proxy?url=..." }));
     return;
   }
 

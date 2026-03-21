@@ -41,6 +41,11 @@ const SUPPORTED_CHAINS = {
   8453: { name: "Base", hex: "0x2105" },
 };
 
+const CHAIN_ICON_COLORS = {
+  1: "bg-blue-500", 56: "bg-yellow-500", 137: "bg-purple-500",
+  43114: "bg-red-500", 42161: "bg-sky-500", 10: "bg-red-400", 8453: "bg-blue-600",
+};
+
 // Per-chain RPC endpoints with fallbacks
 // RPC list is managed in src/chainRpcs.json
 const CHAIN_RPCS = chainRpcsData;
@@ -812,7 +817,7 @@ const tryWithFallback = async (chainId, fn) => {
         <div>
           <div className="border border-gray-200 rounded-xl px-3 py-2.5 flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <span className="w-6 h-6 bg-yellow-500 rounded-full flex items-center justify-center text-white text-xs font-bold">
+              <span className={`w-6 h-6 ${CHAIN_ICON_COLORS[currentChainId] || "bg-gray-400"} rounded-full flex items-center justify-center text-white text-xs font-bold`}>
                 {(SUPPORTED_CHAINS[currentChainId]?.name || customChain?.name || "?").charAt(0)}
               </span>
               <span className="font-semibold text-sm text-gray-900">
@@ -1060,7 +1065,7 @@ const tryWithFallback = async (chainId, fn) => {
                 <path strokeLinecap="round" strokeLinejoin="round" d="M18.75 19.5l-7.5-7.5 7.5-7.5m-6 15L5.25 12l7.5-7.5" />
               </svg>
             </button>
-            <span className="w-5 h-5 bg-yellow-500 rounded-full flex items-center justify-center text-white text-[10px] font-bold flex-shrink-0">
+            <span className={`w-5 h-5 ${CHAIN_ICON_COLORS[currentChainId] || "bg-gray-400"} rounded-full flex items-center justify-center text-white text-[10px] font-bold flex-shrink-0`}>
               {(SUPPORTED_CHAINS[currentChainId]?.name || customChain?.name || "?").charAt(0)}
             </span>
             <span className="text-sm font-semibold text-gray-800 truncate">
