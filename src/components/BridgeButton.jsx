@@ -1,10 +1,11 @@
 import { useState, useEffect } from "react";
 import { ethers } from "ethers";
 import oftAbi from "../abis/OFT.json";
+import chainRpcsData from "../chainRpcs.json";
 import Alert from "./Alert";
 import SendParamsEditor from "./SendParamsEditor";
 import { LogOut } from "lucide-react";
-// import OftScanner from "./OftScanner";
+import OftScanner from "./OftScanner";
 
 // CoinGecko platform ID mapping
 const CGC_PLATFORMS = {
@@ -41,50 +42,8 @@ const SUPPORTED_CHAINS = {
 };
 
 // Per-chain RPC endpoints with fallbacks
-const CHAIN_RPCS = {
-  1: [
-    "https://eth.llamarpc.com",
-    "https://rpc.ankr.com/eth",
-    "https://eth.rpc.blxrbdn.com",
-    "https://ethereum-rpc.publicnode.com",
-  ],
-  56: [
-    "https://bsc-dataseed.binance.org",
-    "https://bsc-dataseed1.defibit.io",
-    "https://bsc-dataseed1.ninicoin.io",
-    "https://bsc.publicnode.com",
-  ],
-  137: [
-    "https://polygon-rpc.com",
-    "https://rpc.ankr.com/polygon",
-    "https://polygon.llamarpc.com",
-    "https://polygon-bor-rpc.publicnode.com",
-  ],
-  43114: [
-    "https://api.avax.network/ext/bc/C/rpc",
-    "https://rpc.ankr.com/avalanche",
-    "https://avalanche.public-rpc.com",
-    "https://avalanche-c-chain-rpc.publicnode.com",
-  ],
-  42161: [
-    "https://arb1.arbitrum.io/rpc",
-    "https://rpc.ankr.com/arbitrum",
-    "https://arbitrum.llamarpc.com",
-    "https://arbitrum-one-rpc.publicnode.com",
-  ],
-  10: [
-    "https://mainnet.optimism.io",
-    "https://rpc.ankr.com/optimism",
-    "https://optimism.llamarpc.com",
-    "https://optimism-rpc.publicnode.com",
-  ],
-  8453: [
-    "https://mainnet.base.org",
-    "https://base.llamarpc.com",
-    "https://base-rpc.publicnode.com",
-    "https://1rpc.io/base",
-  ],
-};
+// RPC list is managed in src/chainRpcs.json
+const CHAIN_RPCS = chainRpcsData;
 
 const RPC_TAB_LABELS = ["Def", "Fb1", "Fb2", "Fb3", "Cus"];
 const CUSTOM_RPC_INDEX = 4;
@@ -144,7 +103,9 @@ const BridgeButton = ({ signer, address, disconnect }) => {
   });
   const [showSavedRoutes, setShowSavedRoutes] = useState(false);
   const [setupCollapsed, setSetupCollapsed] = useState(false);
-  // const [showOftScanner, setShowOftScanner] = useState(false);
+  const [showOftScanner, setShowOftScanner] = useState(false);
+  const [oftScannerToken, setOftScannerToken] = useState(null);
+  const [autoOftScan, setAutoOftScan] = useState(() => localStorage.getItem("lz_auto_oft_scan") !== "false");
   const [showSettings, setShowSettings] = useState(false);
   const [autoBalanceEnabled, setAutoBalanceEnabled] = useState(() => localStorage.getItem("lz_auto_balance") !== "false");
   const [autoBalanceInterval, setAutoBalanceInterval] = useState(() => {
@@ -535,7 +496,34 @@ const tryWithFallback = async (chainId, fn) => {
       if (err.message === "CONTRACT_NOT_FOUND") {
         setAlert({ type: "error", message: "Contract does not exist on this chain!" });
       } else if (err.message === "TOKEN_READ_FAIL") {
-        setAlert({ type: "error", message: "Failed to read token info from contract" });
+        // Check if address itself is a native OFT (has endpoint/oftVersion but no token())
+        try {
+          const p = !useWalletRpc && CHAIN_RPCS[currentChainId]
+            ? new ethers.JsonRpcProvider(CHAIN_RPCS[currentChainId][0])
+            : provider;
+          const OFT_MINI = [
+            "function endpoint() view returns (address)",
+            "function oftVersion() view returns (bytes4, uint64)",
+          ];
+          const c = new ethers.Contract(oftAddress, OFT_MINI, p);
+          const [ep, ver] = await Promise.all([
+            c.endpoint().catch(() => null),
+            c.oftVersion().catch(() => null),
+          ]);
+          if (ep || ver) {
+            // It IS a native OFT — re-run check treating token = self
+            setAlert({ type: "info", message: "Native OFT detected (token = contract itself). Re-checking..." });
+            return;
+          }
+        } catch { /* ignore */ }
+        // Not an OFT at all — open scanner if setting is on
+        if (autoOftScan) {
+          setAlert({ type: "info", message: "Not an OFT contract. Opening scanner to find OFT from holders..." });
+          setOftScannerToken(oftAddress);
+          setShowOftScanner(true);
+        } else {
+          setAlert({ type: "error", message: "Not an OFT contract. You can enable \"Auto-scan OFT\" in Settings to automatically search for OFT among holders." });
+        }
       } else {
         setAlert({
           type: "error",
@@ -926,19 +914,8 @@ const tryWithFallback = async (chainId, fn) => {
             onClick={handleCheck}
             className="flex-1 py-2.5 bg-gray-900 text-white font-semibold rounded-xl hover:bg-gray-800 transition text-sm"
           >
-            Verify Contract
+            Check
           </button>
-          {/* OFT Scanner button — disabled temporarily
-          <button
-            onClick={() => setShowOftScanner(true)}
-            className="px-3 py-2.5 bg-gray-50 border border-gray-200 text-gray-600 font-semibold rounded-xl hover:bg-gray-100 transition text-sm flex items-center gap-1.5"
-            title="Scan for OFT contract from token holders"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-4 h-4">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
-            </svg>
-          </button>
-          */}
           <button
             onClick={() => setShowSavedRoutes(true)}
             className="px-3 py-2.5 bg-gray-50 border border-gray-200 text-gray-600 font-semibold rounded-xl hover:bg-gray-100 transition text-sm flex items-center gap-1.5"
@@ -1359,10 +1336,9 @@ const tryWithFallback = async (chainId, fn) => {
         )}
       </div>
 
-      {/* OFT Scanner Modal — disabled temporarily
       <OftScanner
         show={showOftScanner}
-        onClose={() => setShowOftScanner(false)}
+        onClose={() => { setShowOftScanner(false); setOftScannerToken(null); }}
         onSelect={(addr) => {
           setOftAddress(addr);
           setAutoCheck(true);
@@ -1370,8 +1346,8 @@ const tryWithFallback = async (chainId, fn) => {
         chainId={currentChainId}
         provider={provider}
         chainRpcs={CHAIN_RPCS}
+        initialToken={oftScannerToken}
       />
-      */}
 
       {/* Settings Modal */}
       {showSettings && (
@@ -1386,18 +1362,35 @@ const tryWithFallback = async (chainId, fn) => {
               </button>
             </div>
             <div className="px-5 py-4 flex flex-col gap-4">
+              {/* Auto OFT Scanner on non-OFT contract */}
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-gray-600">Auto-scan OFT if not OFT contract</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !autoOftScan;
+                    setAutoOftScan(next);
+                    localStorage.setItem("lz_auto_oft_scan", String(next));
+                  }}
+                  className={`w-10 h-[22px] rounded-full transition-colors relative ${autoOftScan ? "bg-gray-800" : "bg-gray-300"}`}
+                >
+                  <span className={`absolute top-0.5 left-0.5 w-[18px] h-[18px] bg-white rounded-full shadow transition-transform duration-200 ${autoOftScan ? "translate-x-[18px]" : "translate-x-0"}`} />
+                </button>
+              </div>
+
               {/* Auto refresh balance */}
               <div className="flex items-center justify-between">
                 <span className="text-sm text-gray-600">Auto refresh balance</span>
                 <button
+                  type="button"
                   onClick={() => {
                     const next = !autoBalanceEnabled;
                     setAutoBalanceEnabled(next);
                     localStorage.setItem("lz_auto_balance", String(next));
                   }}
-                  className={`w-10 h-[22px] rounded-full transition relative ${autoBalanceEnabled ? "bg-gray-800" : "bg-gray-300"}`}
+                  className={`w-10 h-[22px] rounded-full transition-colors relative ${autoBalanceEnabled ? "bg-gray-800" : "bg-gray-300"}`}
                 >
-                  <span className={`absolute top-0.5 w-[18px] h-[18px] bg-white rounded-full shadow transition-transform ${autoBalanceEnabled ? "translate-x-[18px]" : "translate-x-0.5"}`} />
+                  <span className={`absolute top-0.5 left-0.5 w-[18px] h-[18px] bg-white rounded-full shadow transition-transform duration-200 ${autoBalanceEnabled ? "translate-x-[18px]" : "translate-x-0"}`} />
                 </button>
               </div>
               {autoBalanceEnabled && (

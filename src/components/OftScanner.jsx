@@ -1,16 +1,20 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { ethers } from "ethers";
 
-// Explorer API config per chain (Etherscan-compatible APIs)
-const EXPLORER_APIS = {
-  1: { url: "https://api.etherscan.io/api", name: "Etherscan" },
-  56: { url: "https://api.bscscan.com/api", name: "BSCScan" },
-  137: { url: "https://api.polygonscan.com/api", name: "Polygonscan" },
-  43114: { url: "https://api.snowtrace.io/api", name: "Snowtrace" },
-  42161: { url: "https://api.arbiscan.io/api", name: "Arbiscan" },
-  10: { url: "https://api-optimistic.etherscan.io/api", name: "Optimism Etherscan" },
-  8453: { url: "https://api.basescan.org/api", name: "Basescan" },
+// OKLink chain slugs (matches oklink.com/<slug>)
+const OKLINK_CHAINS = {
+  1:     "eth",
+  56:    "bsc",
+  137:   "polygon",
+  43114: "avax-c",
+  42161: "arbitrum-one",
+  10:    "optimism",
+  8453:  "base",
 };
+
+// Proxy server URL — run `node oklink-proxy.mjs` alongside the dev server
+// Change to your deployed URL in production
+const OKLINK_PROXY = process.env.REACT_APP_OKLINK_PROXY || "http://localhost:3001";
 
 const OFT_CHECK_ABI = [
   "function token() view returns (address)",
@@ -24,19 +28,28 @@ const ERC20_ABI = [
   "function balanceOf(address) view returns (uint256)",
 ];
 
-const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvider, chainRpcs }) => {
+const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvider, chainRpcs, initialToken }) => {
   const [tokenAddress, setTokenAddress] = useState("");
   const [status, setStatus] = useState(null); // null | "scanning" | "done" | "error"
   const [progress, setProgress] = useState("");
   const [results, setResults] = useState([]);
-  const [apiKey, setApiKey] = useState(() => {
-    try { return JSON.parse(localStorage.getItem("lz_explorer_keys") || "{}"); } catch { return {}; }
-  });
-  const [showApiKey, setShowApiKey] = useState(false);
+
+  // Auto-fill + auto-scan when opened with an initialToken
+  useEffect(() => {
+    if (!show) return;
+    if (initialToken && ethers.isAddress(initialToken)) {
+      setTokenAddress(initialToken);
+      setStatus(null);
+      setProgress("");
+      setResults([]);
+      setTimeout(() => scan(initialToken), 50);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [show, initialToken]);
 
   if (!show) return null;
 
-  const explorer = EXPLORER_APIS[chainId];
+  const oklinkChain = OKLINK_CHAINS[chainId];
 
   const getProvider = () => {
     if (externalProvider) return externalProvider;
@@ -48,37 +61,34 @@ const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvid
   const checkCandidatesForOFT = async (candidates, p, targetToken) => {
     if (candidates.length === 0) {
       setStatus("done");
-      setProgress("No contract holders found in 0.2%-15% range");
+      setProgress("No contract holders found in range");
       return;
     }
 
+    const CONCURRENCY = 8;
     const found = [];
+    let checked = 0;
 
-    for (let i = 0; i < candidates.length; i++) {
-      const c = candidates[i];
-      setProgress(`Checking OFT ${i + 1}/${candidates.length}: ${c.address.slice(0, 10)}...`);
-
+    const checkOne = async (c) => {
       try {
         const contract = new ethers.Contract(c.address, OFT_CHECK_ABI, p);
 
-        let linkedToken;
+        let linkedToken = null;
+        let isMatch = false;
         try {
           linkedToken = await contract.token();
-        } catch {
-          continue;
-        }
+          isMatch = linkedToken.toLowerCase() === targetToken.toLowerCase();
+        } catch { /* OFT may not have token() */ }
 
-        const isMatch = linkedToken.toLowerCase() === targetToken.toLowerCase();
+        const [endpointAddr, versionRaw] = await Promise.all([
+          contract.endpoint().catch(() => null),
+          contract.oftVersion().catch(() => null),
+        ]);
+        const version = versionRaw ? versionRaw.toString() : null;
 
-        let endpointAddr = null;
-        let version = null;
-        try { endpointAddr = await contract.endpoint(); } catch {}
-        try {
-          const v = await contract.oftVersion();
-          version = v.toString();
-        } catch {}
+        if (!endpointAddr && !version) return null;
 
-        found.push({
+        return {
           address: c.address,
           balance: c.balance,
           percentage: c.percentage,
@@ -87,10 +97,21 @@ const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvid
           isTokenMatch: isMatch,
           endpoint: endpointAddr,
           version,
-        });
+        };
       } catch {
-        // Not OFT
+        return null;
       }
+    };
+
+    // Run in concurrent batches
+    for (let i = 0; i < candidates.length; i += CONCURRENCY) {
+      const batch = candidates.slice(i, i + CONCURRENCY);
+      setProgress(`Checking OFT ${i + 1}–${Math.min(i + CONCURRENCY, candidates.length)}/${candidates.length}...`);
+      const results = await Promise.all(batch.map(checkOne));
+      for (const r of results) {
+        if (r) found.push(r);
+      }
+      checked += batch.length;
     }
 
     setResults(found);
@@ -143,11 +164,12 @@ const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvid
     const candidates = [];
     const addresses = Array.from(addressSet);
 
+    // Parallel getCode + balanceOf in batches of 10
     for (let i = 0; i < addresses.length; i += 10) {
       const batch = addresses.slice(i, i + 10);
       setProgress(`Checking ${Math.min(i + 10, addresses.length)}/${addresses.length} addresses...`);
 
-      const batchResults = await Promise.allSettled(
+      const batchResults = await Promise.all(
         batch.map(async (addr) => {
           const [code, bal] = await Promise.all([
             p.getCode(addr),
@@ -161,7 +183,7 @@ const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvid
       );
 
       for (const r of batchResults) {
-        if (r.status === "fulfilled" && r.value) candidates.push(r.value);
+        if (r) candidates.push(r);
       }
     }
 
@@ -169,71 +191,108 @@ const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvid
     await checkCandidatesForOFT(candidates, p, tokenAddr);
   };
 
-  const scan = async () => {
-    const addr = tokenAddress.trim();
+  const scan = async (overrideAddr) => {
+    const addr = (overrideAddr || tokenAddress).trim();
     if (!ethers.isAddress(addr)) return;
     if (!chainId || chainId === "custom") return;
-    if (!explorer) return;
+    if (!oklinkChain) return;
 
     setStatus("scanning");
     setResults([]);
-    setProgress("Fetching top holders...");
+    setProgress("Checking if token itself is OFT...");
 
     try {
       const p = getProvider();
       if (!p) throw new Error("No RPC available");
 
-      const key = apiKey[chainId] || "";
-      const keyParam = key ? `&apikey=${encodeURIComponent(key)}` : "";
-      const holdersUrl = `${explorer.url}?module=token&action=tokenholderlist&contractaddress=${encodeURIComponent(addr)}&page=1&offset=50${keyParam}`;
+      // ── Step 0: check if the token contract itself is an OFT ──────────────
+      try {
+        const selfContract = new ethers.Contract(addr, OFT_CHECK_ABI, p);
+        const [endpointAddr, versionRaw] = await Promise.all([
+          selfContract.endpoint().catch(() => null),
+          selfContract.oftVersion().catch(() => null),
+        ]);
+        const version = versionRaw ? versionRaw.toString() : null;
 
-      const resp = await fetch(holdersUrl);
-      const data = await resp.json();
+        if (endpointAddr || version) {
+          let linkedToken = null;
+          let isMatch = false;
+          try {
+            linkedToken = await selfContract.token();
+            isMatch = linkedToken.toLowerCase() === addr.toLowerCase();
+          } catch { isMatch = true; /* token IS the OFT */ }
 
-      if (data.status !== "1" || !Array.isArray(data.result) || data.result.length === 0) {
+          setResults([{
+            address: addr,
+            balance: "—",
+            percentage: 100,
+            decimals: -1,
+            linkedToken,
+            isTokenMatch: isMatch,
+            endpoint: endpointAddr,
+            version,
+            isSelf: true,
+          }]);
+          setStatus("done");
+          setProgress("Token contract itself is an OFT!");
+          return;
+        }
+      } catch { /* not OFT, continue to holder scan */ }
+
+      // ── Step 1: scan top holders via OKLink ───────────────────────────────
+      setProgress("Fetching top holders via OKLink...");
+
+      const proxyUrl = `${OKLINK_PROXY}/api/holders/${oklinkChain}/${addr}?offset=0&limit=50&sort=value%2Cdesc`;
+      const resp = await fetch(proxyUrl);
+      if (!resp.ok) throw new Error(`Proxy error: ${resp.status}`);
+      const json = await resp.json();
+
+      const code = json.code;
+      const ok   = code === 0 || code === "0";
+
+      if (!ok) {
+        console.warn("OKLink API failed:", json);
         await scanViaTransfers(p, addr);
         return;
       }
 
-      setProgress(`Got ${data.result.length} holders, filtering...`);
+      const d       = json.data || {};
+      const rawList = d.hits || d.holderList || [];
 
-      const tokenContract = new ethers.Contract(addr, ERC20_ABI, p);
-      let totalSupply, decimals;
-      try {
-        [totalSupply, decimals] = await Promise.all([
-          tokenContract.totalSupply(),
-          tokenContract.decimals(),
-        ]);
-      } catch {
-        totalSupply = null;
-        decimals = 18;
+      if (rawList.length === 0) {
+        await scanViaTransfers(p, addr);
+        return;
       }
 
-      const holders = [];
-      for (const h of data.result) {
-        const holderAddr = ethers.getAddress(h.TokenHolderAddress);
-        const qty = ethers.toBigInt(h.TokenHolderQuantity);
-        let pct = 0;
-        if (totalSupply) {
-          pct = Number(qty * ethers.toBigInt(10000) / totalSupply) / 100;
-        }
-        if (pct < 0.2 || pct > 15) continue;
-        holders.push({ address: holderAddr, balance: qty, percentage: pct, decimals: Number(decimals) });
-      }
+      setProgress(`Got ${rawList.length} holders from OKLink, filtering...`);
 
-      setProgress(`Found ${holders.length} holders in range, checking contracts...`);
+      // rate is 0-1 fraction → pct = rate * 100
+      const holders = rawList
+        .filter(h => {
+          const pct = parseFloat(h.rate ?? 0) * 100;
+          return pct >= 0.2 && pct <= 15;
+        })
+        .map(h => ({
+          address:    ethers.getAddress(h.holderAddress),
+          balance:    h.value,
+          percentage: parseFloat(h.rate ?? 0) * 100,
+          decimals:   -1,
+        }));
 
+      setProgress(`Found ${holders.length} holders in 0.2%-15% range, checking contracts...`);
+
+      // Check getCode for all holders concurrently (batches of 10)
       const contractHolders = [];
-      for (let i = 0; i < holders.length; i += 5) {
-        const batch = holders.slice(i, i + 5);
-        const codeResults = await Promise.allSettled(
+      for (let i = 0; i < holders.length; i += 10) {
+        const batch = holders.slice(i, i + 10);
+        const codeResults = await Promise.all(
           batch.map(async (c) => {
             const code = await p.getCode(c.address);
             return code !== "0x" ? c : null;
           })
         );
         for (const r of codeResults) {
-          if (r.status === "fulfilled" && r.value) contractHolders.push(r.value);
+          if (r) contractHolders.push(r);
         }
       }
 
@@ -249,8 +308,8 @@ const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvid
 
   const formatBalance = (bal, dec) => {
     try {
-      const str = ethers.formatUnits(bal, dec);
-      const num = parseFloat(str);
+      // dec === -1 → balance is already a human-readable float (from OKLink)
+      const num = dec === -1 ? Number(bal) : parseFloat(ethers.formatUnits(bal, dec));
       if (num > 1e6) return (num / 1e6).toFixed(2) + "M";
       if (num > 1e3) return (num / 1e3).toFixed(2) + "K";
       return num.toFixed(2);
@@ -289,47 +348,19 @@ const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvid
             />
           </div>
 
-          {/* API Key toggle */}
-          <div>
-            <button
-              onClick={() => setShowApiKey(!showApiKey)}
-              className="text-xs text-gray-400 hover:text-gray-600 transition flex items-center gap-1"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor" className="w-3 h-3">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 5.25a3 3 0 013 3m3 0a6 6 0 01-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1121.75 8.25z" />
-              </svg>
-              Explorer API Key {showApiKey ? "▲" : "▼"}
-            </button>
-            {showApiKey && (
-              <div className="mt-2 flex gap-1.5">
-                <input
-                  type="text"
-                  value={apiKey[chainId] || ""}
-                  onChange={e => {
-                    const updated = { ...apiKey, [chainId]: e.target.value };
-                    setApiKey(updated);
-                    localStorage.setItem("lz_explorer_keys", JSON.stringify(updated));
-                  }}
-                  placeholder={`${explorer?.name || "Explorer"} API key (optional, increases rate limit)`}
-                  className="flex-1 border border-gray-200 px-2.5 py-1.5 rounded-lg text-xs font-mono focus:outline-none focus:ring-1 focus:ring-gray-300"
-                />
-              </div>
-            )}
-          </div>
-
           {/* Info */}
           <div className="text-xs text-gray-400 bg-gray-50 rounded-lg px-3 py-2">
-            Scans top holders (0.2% - 15% supply) that are <strong>contracts</strong>, then checks each for OFT interface ({explorer?.name || "Explorer API"} + RPC).
+            Scans top holders (0.2%–15% supply) that are <strong>contracts</strong>, then checks each for OFT interface (OKLink API + RPC).{!oklinkChain && <span className="text-orange-500 ml-1">⚠ Chain not supported yet.</span>}
           </div>
 
           {/* Scan button */}
           <button
             onClick={scan}
-            disabled={status === "scanning" || !ethers.isAddress(tokenAddress.trim()) || !explorer}
+            disabled={status === "scanning" || !ethers.isAddress(tokenAddress.trim()) || !oklinkChain}
             className={`w-full py-2.5 font-semibold rounded-xl transition text-sm ${
               status === "scanning"
                 ? "bg-gray-200 text-gray-500 cursor-wait"
-                : !explorer
+                : !oklinkChain
                 ? "bg-gray-100 text-gray-400 cursor-not-allowed"
                 : "bg-gray-900 text-white hover:bg-gray-800"
             }`}
@@ -378,7 +409,10 @@ const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvid
                     )}
                   </div>
                   <div className="flex items-center gap-3 text-xs text-gray-500">
-                    <span>Holds: {formatBalance(r.balance, r.decimals)} ({r.percentage.toFixed(2)}%)</span>
+                    {r.isSelf
+                      ? <span className="italic">This token is the OFT contract</span>
+                      : <span>Holds: {formatBalance(r.balance, r.decimals)} ({r.percentage.toFixed(2)}%)</span>
+                    }
                     {r.endpoint && <span>Endpoint: {r.endpoint.slice(0, 8)}...</span>}
                     {r.version && <span>Ver: {r.version}</span>}
                   </div>
