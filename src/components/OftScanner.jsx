@@ -67,7 +67,6 @@ const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvid
 
     const CONCURRENCY = 8;
     const found = [];
-    let checked = 0;
 
     const checkOne = async (c) => {
       try {
@@ -111,7 +110,6 @@ const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvid
       for (const r of results) {
         if (r) found.push(r);
       }
-      checked += batch.length;
     }
 
     setResults(found);
