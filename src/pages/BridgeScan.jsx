@@ -83,6 +83,17 @@ let hyperlaneRegistryCache = null;
 const PROXY = process.env.REACT_APP_OKLINK_PROXY ||
   (process.env.NODE_ENV === "development" ? "http://localhost:3001" : "");
 
+const OFT_CHECK_ABI = [
+  "function token() view returns (address)",
+  "function endpoint() view returns (address)",
+  "function oftVersion() view returns (bytes4 interfaceId, uint64 version)",
+];
+
+const OKLINK_CHAINS = {
+  1: "eth", 56: "bsc", 137: "polygon", 43114: "avax-c",
+  42161: "arbitrum-one", 10: "optimism", 8453: "base",
+};
+
 function proxied(url) {
   return `${PROXY}/api/fetch-proxy?url=${encodeURIComponent(url)}`;
 }
@@ -307,13 +318,118 @@ export default function BridgeScan() {
       setProtocolStatus(prev => ({ ...prev, [key]: { done: true, found: false, data: [], error: null, ...patch } }));
 
     Promise.all([
-      // ── LayerZero ──
-      fetchLzTokens()
-        .then(tokens => {
+      // ── LayerZero ── (3-stage: API list → self OFT check → OFT holder scan)
+      (async () => {
+        const setLzProgress = (msg) =>
+          setProtocolStatus(prev => ({
+            ...prev,
+            LayerZero: { ...prev.LayerZero, progress: msg },
+          }));
+        try {
+          // Stage 1: LZ token list API
+          const tokens = await fetchLzTokens();
           const matches = checkLayerZero(tokens, addr, activeChainId);
-          update("LayerZero", { found: matches.length > 0, data: matches });
-        })
-        .catch(err => update("LayerZero", { error: err.message })),
+          if (matches.length > 0) {
+            update("LayerZero", { found: true, data: matches });
+            return;
+          }
+
+          // Stage 2: self-check — is the contract itself an OFT?
+          const rpcUrl = getActiveRpc();
+          if (rpcUrl) {
+            setLzProgress("Not in LZ list, checking contract itself...");
+            try {
+              const p = new ethers.JsonRpcProvider(rpcUrl);
+              const selfC = new ethers.Contract(addr, OFT_CHECK_ABI, p);
+              const [epAddr, versionRaw] = await Promise.all([
+                selfC.endpoint().catch(() => null),
+                selfC.oftVersion().catch(() => null),
+              ]);
+              const version = versionRaw ? versionRaw.toString() : null;
+              if (epAddr || version) {
+                let linkedToken = null;
+                try { linkedToken = await selfC.token(); } catch {}
+                update("LayerZero", {
+                  found: true,
+                  data: [{ isSelf: true, address: addr, endpoint: epAddr, version, linkedToken }],
+                });
+                return;
+              }
+            } catch { /* ignore, move to stage 3 */ }
+
+            // Stage 3: OFT holder scanner via OKLink
+            const oklinkChain = OKLINK_CHAINS[activeChainId];
+            if (oklinkChain) {
+              setLzProgress("Scanning OFT holders via OKLink...");
+              try {
+                const p = new ethers.JsonRpcProvider(rpcUrl);
+                const resp = await fetch(`${PROXY}/api/holders/${oklinkChain}/${addr}?offset=0&limit=50&sort=value%2Cdesc`);
+                let rawList = [];
+                if (resp.ok) {
+                  const json = await resp.json();
+                  rawList = json.data?.hits || json.data?.holderList || [];
+                }
+
+                const candidates = rawList
+                  .map(h => {
+                    const pct = parseFloat(h.rate ?? 0) * 100;
+                    return (pct >= 0.2 && pct <= 15)
+                      ? { address: h.holderAddress, balance: h.value, percentage: pct }
+                      : null;
+                  })
+                  .filter(Boolean);
+
+                // Keep only contract addresses
+                const contractHolders = (await Promise.all(
+                  candidates.map(async c => {
+                    try {
+                      const code = await p.getCode(ethers.getAddress(c.address));
+                      return code !== "0x" ? { ...c, address: ethers.getAddress(c.address) } : null;
+                    } catch { return null; }
+                  })
+                )).filter(Boolean);
+
+                setLzProgress(`Found ${contractHolders.length} contract holder(s), checking OFT interface...`);
+
+                const CONCURRENCY = 8;
+                const found = [];
+                for (let i = 0; i < contractHolders.length; i += CONCURRENCY) {
+                  const batch = contractHolders.slice(i, i + CONCURRENCY);
+                  setLzProgress(`Checking OFT ${i + 1}–${Math.min(i + CONCURRENCY, contractHolders.length)}/${contractHolders.length}...`);
+                  const batchResults = await Promise.all(batch.map(async c => {
+                    try {
+                      const contract = new ethers.Contract(c.address, OFT_CHECK_ABI, p);
+                      let linkedToken = null, isMatch = false;
+                      try {
+                        linkedToken = await contract.token();
+                        isMatch = linkedToken.toLowerCase() === addr.toLowerCase();
+                      } catch {}
+                      const [endpointAddr, versionRaw] = await Promise.all([
+                        contract.endpoint().catch(() => null),
+                        contract.oftVersion().catch(() => null),
+                      ]);
+                      const version = versionRaw ? versionRaw.toString() : null;
+                      if (!endpointAddr && !version) return null;
+                      return {
+                        address: c.address, balance: c.balance, percentage: c.percentage,
+                        linkedToken, isTokenMatch: isMatch, endpoint: endpointAddr, version,
+                      };
+                    } catch { return null; }
+                  }));
+                  for (const r of batchResults) if (r) found.push(r);
+                }
+
+                update("LayerZero", { found: found.length > 0, data: found });
+                return;
+              } catch { /* fall through to not found */ }
+            }
+          }
+
+          update("LayerZero", { found: false, data: [] });
+        } catch (err) {
+          update("LayerZero", { error: err.message });
+        }
+      })(),
 
       // ── Chainlink CCIP ──
       fetchCcipTokens()
@@ -611,7 +727,7 @@ export default function BridgeScan() {
                         </div>
                         <div className="flex items-center gap-2">
                           {!r.done && (
-                            <span className="text-xs text-gray-400">Checking...</span>
+                            <span className="text-xs text-gray-400">{r.progress || "Checking..."}</span>
                           )}
                           {r.done && r.found && (
                             proto.internal
@@ -666,6 +782,13 @@ export default function BridgeScan() {
                           {t.localDomain != null && <span><span className="text-gray-400">Local domain:</span> {t.localDomain}</span>}
                           {t.domains?.length > 0 && <span className="w-full"><span className="text-gray-400">Remote domains ({t.domains.length}):</span> {t.domains.join(", ")}</span>}
                           {t.version && <span><span className="text-gray-400">Version:</span> {t.version}</span>}
+                          {/* LayerZero OFT self-check / scanner fields */}
+                          {t.isSelf && <span className="w-full font-semibold text-green-700">✓ Contract itself is OFT</span>}
+                          {t.address && !t.isSelf && <span className="w-full"><span className="text-gray-400">OFT addr:</span> <span className="font-mono">{t.address}</span></span>}
+                          {t.endpoint && <span className="w-full"><span className="text-gray-400">Endpoint:</span> <span className="font-mono">{t.endpoint}</span></span>}
+                          {t.isTokenMatch && <span className="text-green-600 font-medium">✓ Token match</span>}
+                          {t.linkedToken && !t.isTokenMatch && <span className="w-full"><span className="text-gray-400">Linked token:</span> <span className="font-mono">{t.linkedToken}</span></span>}
+                          {t.percentage != null && <span><span className="text-gray-400">Holding:</span> {t.percentage.toFixed(2)}%</span>}
                         </div>
                       ))}
                       {r.done && r.error && (
