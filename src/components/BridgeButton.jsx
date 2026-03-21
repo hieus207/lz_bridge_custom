@@ -262,6 +262,7 @@ const tryWithFallback = async (chainId, fn) => {
       const p = new ethers.JsonRpcProvider(startUrl);
       return await fn(p);
     } catch (err) {
+      if (err.message === "TOKEN_READ_FAIL" || err.message === "CONTRACT_NOT_FOUND") throw err;
       console.error(`RPC[${startIdx}] ${startUrl} failed:`, err.message);
     }
   }
@@ -282,6 +283,7 @@ const tryWithFallback = async (chainId, fn) => {
       setAlert({ type: "info", message: `Auto-fallback to ${RPC_TAB_LABELS[i] || "Cus"}` });
       return result;
     } catch (err) {
+      if (err.message === "TOKEN_READ_FAIL" || err.message === "CONTRACT_NOT_FOUND") throw err;
       console.error(`RPC[${i}] ${builtIn[i]} failed:`, err.message);
     }
   }
@@ -300,6 +302,7 @@ const tryWithFallback = async (chainId, fn) => {
       setAlert({ type: "info", message: `Auto-fallback to Cus` });
       return result;
     } catch (err) {
+      if (err.message === "TOKEN_READ_FAIL" || err.message === "CONTRACT_NOT_FOUND") throw err;
       console.error(`RPC[Cus] ${customUrl} failed:`, err.message);
     }
   }

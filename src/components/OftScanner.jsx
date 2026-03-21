@@ -14,7 +14,8 @@ const OKLINK_CHAINS = {
 
 // Proxy server URL — run `node oklink-proxy.mjs` alongside the dev server
 // Change to your deployed URL in production
-const OKLINK_PROXY = process.env.REACT_APP_OKLINK_PROXY || "http://localhost:3001";
+const OKLINK_PROXY = process.env.REACT_APP_OKLINK_PROXY ||
+  (process.env.NODE_ENV === "development" ? "http://localhost:3001" : "");
 
 const OFT_CHECK_ABI = [
   "function token() view returns (address)",
