@@ -13,8 +13,8 @@ function Bridge() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-[#f5f0e6] font-sans px-4 py-8">
-      <div className="w-full max-w-4xl">
+    <div className="min-h-screen flex items-start justify-center bg-[#f5f0e6] font-sans px-4 py-8">
+      <div className="w-full max-w-7xl">
         {address ? (
           <BridgeButton signer={signer} address={address} disconnect={disconnect} />
         ) : (

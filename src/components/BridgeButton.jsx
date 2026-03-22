@@ -118,6 +118,29 @@ const BridgeButton = ({ signer, address, disconnect }) => {
     return isNaN(saved) ? 10 : saved;
   });
   const [balanceLoading, setBalanceLoading] = useState(false);
+  const [txHistory, setTxHistory] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem("lz_tx_history") || "[]");
+    } catch {}
+    return [];
+  });
+  const [showTxHistory, setShowTxHistory] = useState(true);
+
+// Helper: sync URL bar with current state (no page reload)
+  const updateUrl = (overrides = {}) => {
+    const p = new URLSearchParams();
+    const addr = overrides.oftadr ?? oftAddress;
+    const chain = overrides.chainId ?? currentChainId;
+    const dst = overrides.dstEid ?? dstEidValue;
+    const extra = overrides.extraOp ?? localStorage.getItem("lz_extraOptions") ?? "0x";
+    if (addr) p.set("oftadr", addr);
+    if (chain) p.set("chainId", String(chain));
+    if (dst) p.set("dstEid", String(dst));
+    if (extra && extra !== "0x") p.set("extraOp", extra);
+    p.set("auto", "true");
+    const qs = p.toString();
+    window.history.replaceState(null, "", qs ? `${window.location.pathname}?${qs}` : window.location.pathname);
+  };
 
 useEffect(() => {
   const params = new URLSearchParams(window.location.search);
@@ -138,6 +161,23 @@ useEffect(() => {
       }
     }
   }
+
+  // Read dstEid from URL and sync dropdown
+  const dstEidParam = params.get("dstEid");
+  if (dstEidParam) {
+    const parsed = Number(dstEidParam);
+    if (!isNaN(parsed) && parsed > 0) {
+      setDstEidValue(parsed);
+      // Find matching chain name for the dropdown
+      const matchingChain = Object.entries(CHAINS).find(([, eid]) => eid === parsed);
+      if (matchingChain) {
+        setDstChain(matchingChain[0]);
+      } else {
+        setDstChain("Custom");
+      }
+    }
+  }
+
   const auto = params.get("auto");
   if (auto) {
     console.log("auto check enabled");
@@ -480,10 +520,9 @@ const tryWithFallback = async (chainId, fn) => {
       // Fetch balance
       await refreshBalance(tokenAddress, decimals);
 
-      const params = new URLSearchParams(window.location.search);
       const recipient = await signer.getAddress();
-      const dstEid = Number(params.get("dstEid")) || Number(dstEidValue);
-      const extraOptions = params.get("extraOp") || localStorage.getItem("lz_extraOptions") || "0x";
+      const dstEid = Number(dstEidValue);
+      const extraOptions = localStorage.getItem("lz_extraOptions") || "0x";
 
       const amountWei = ethers.parseUnits(amount, decimals);
 
@@ -496,6 +535,9 @@ const tryWithFallback = async (chainId, fn) => {
         composeMsg: "0x",
         oftCmd: "0x",
       });
+
+      // Sync URL bar with current state
+      updateUrl({ dstEid });
 
       if (requireApprove && ethers.isAddress(tokenAddress)) {
         await checkApproval(tokenAddress, oftAddress, amount, decimals);
@@ -585,6 +627,22 @@ const tryWithFallback = async (chainId, fn) => {
       const receipt = await tx.wait();
       if (receipt.status === 1) {
       setAlert({ type: "success", message: `Bridge success! <a class='underline underline-offset-2' target='_blank' href='https://layerzeroscan.com/tx/${tx.hash}'>${tx.hash.substring(0,10)}...</a>` });
+      // Save to TX history
+      const txRecord = {
+        hash: tx.hash,
+        srcChain: SUPPORTED_CHAINS[currentChainId]?.name || `Chain ${currentChainId}`,
+        dstChain: dstChain,
+        symbol: info?.symbol || "?",
+        amount: amount,
+        dstEid: sendParams?.dstEid,
+        status: "success",
+        timestamp: Date.now(),
+      };
+      setTxHistory(prev => {
+        const updated = [txRecord, ...prev.filter(t => t.hash !== tx.hash)].slice(0, 50);
+        localStorage.setItem("lz_tx_history", JSON.stringify(updated));
+        return updated;
+      });
       // Reload balance after successful bridge
       if (info?.tokenAddress && info?.decimals != null) {
         setTimeout(() => refreshBalance(info.tokenAddress, info.decimals), 2000);
@@ -593,6 +651,22 @@ const tryWithFallback = async (chainId, fn) => {
         setAlert({
           type: "error",
           message: `Transaction failed! TxHash: ${tx.hash}`,
+        });
+        // Save failed TX to history
+        const txRecord = {
+          hash: tx.hash,
+          srcChain: SUPPORTED_CHAINS[currentChainId]?.name || `Chain ${currentChainId}`,
+          dstChain: dstChain,
+          symbol: info?.symbol || "?",
+          amount: amount,
+          dstEid: sendParams?.dstEid,
+          status: "failed",
+          timestamp: Date.now(),
+        };
+        setTxHistory(prev => {
+          const updated = [txRecord, ...prev.filter(t => t.hash !== tx.hash)].slice(0, 50);
+          localStorage.setItem("lz_tx_history", JSON.stringify(updated));
+          return updated;
         });
       }
     } catch (err) {
@@ -775,7 +849,7 @@ const tryWithFallback = async (chainId, fn) => {
     <div className="flex flex-col lg:flex-row gap-6 w-full">
       {/* ====== LEFT PANEL — Setup ====== */}
       {!setupCollapsed && (
-      <div className="w-full lg:w-[380px] flex-shrink-0 self-start bg-white rounded-2xl shadow-sm border border-gray-100 p-5 flex flex-col gap-4">
+      <div className="w-full lg:w-[340px] flex-shrink-0 self-start bg-white rounded-2xl shadow-sm border border-gray-100 p-5 flex flex-col gap-4">
         {/* Header + wallet */}
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-bold text-gray-900">Setup Bridge</h2>
@@ -1051,8 +1125,8 @@ const tryWithFallback = async (chainId, fn) => {
       </div>
       )}
 
-      {/* ====== RIGHT PANEL — Bridge form ====== */}
-      <div className={`flex-1 min-w-0 bg-white rounded-2xl shadow-sm border border-gray-100 p-6 flex flex-col gap-5 ${setupCollapsed ? "max-w-2xl mx-auto" : ""}`}>
+      {/* ====== MIDDLE PANEL — Bridge form ====== */}
+      <div className={`flex-1 min-w-0 max-w-xl bg-white rounded-2xl shadow-sm border border-gray-100 p-6 flex flex-col gap-5 ${setupCollapsed ? "max-w-2xl mx-auto" : ""}`}>
         {/* Collapsed setup bar */}
         {setupCollapsed && (
           <div className="flex items-center gap-3 bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5">
@@ -1116,19 +1190,25 @@ const tryWithFallback = async (chainId, fn) => {
             </div>
 
             {/* Token info card */}
-            <div className="border border-gray-200 rounded-2xl p-4 bg-white">
+            {(() => {
+              const srcName = SUPPORTED_CHAINS[currentChainId]?.name || customChain?.name || "";
+              const srcKey = Object.keys(CHAINS).find(k => k === srcName || (k === "BSC" && srcName === "BNB")) || "";
+              const infoBg = ({Ethereum:"bg-blue-100/80",BSC:"bg-yellow-100/80",Polygon:"bg-purple-100/80",Avalanche:"bg-red-100/80",Arbitrum:"bg-sky-100/80",Optimism:"bg-red-50",Base:"bg-blue-200/80",Sonic:"bg-indigo-100/80",Solana:"bg-gradient-to-r from-purple-100/80 to-green-100/80"})[srcKey] || "bg-gray-100/80";
+              const infoIcon = ({Ethereum:"bg-blue-500",BSC:"bg-yellow-500",Polygon:"bg-purple-500",Avalanche:"bg-red-500",Arbitrum:"bg-sky-500",Optimism:"bg-red-400",Base:"bg-blue-600",Sonic:"bg-indigo-500",Solana:"bg-purple-600"})[srcKey] || "bg-gray-400";
+              return (
+            <div className={`rounded-2xl p-4 ${infoBg}`}>
               <div className="flex items-center justify-between mb-3">
                 <div className="flex items-center gap-3">
                   {tokenImage ? (
                     <img src={tokenImage} alt={info.symbol} className="w-10 h-10 rounded-full" />
                   ) : (
-                    <span className="w-10 h-10 bg-red-500 rounded-full flex items-center justify-center text-white text-lg font-bold">
+                    <span className={`w-10 h-10 rounded-full flex items-center justify-center text-white text-lg font-bold ${infoIcon}`}>
                       {info.symbol?.charAt(0) || "T"}
                     </span>
                   )}
                   <div>
                     <div className="font-bold text-gray-900">{info.name || "Token"}</div>
-                    <div className="text-xs text-gray-500">{info.symbol} &bull; {Number(info.decimals)} decimals</div>
+                    <div className="text-xs text-gray-600">{info.symbol} &bull; {Number(info.decimals)} decimals</div>
                   </div>
                 </div>
                 {listingStatus === "CGC listed" && cgcLink ? (
@@ -1138,25 +1218,29 @@ const tryWithFallback = async (chainId, fn) => {
                 ) : (
                   <span className={`text-xs px-2.5 py-1 rounded-full flex items-center gap-1 font-medium ${
                     listingStatus === "Checking..." ? "bg-yellow-100 text-yellow-700" :
-                    "bg-gray-200 text-gray-600"
+                    "bg-white/60 text-gray-600"
                   }`}>
                     {listingStatus || "\u2014"}
                   </span>
                 )}
               </div>
 
-              <div className="bg-white/70 rounded-xl p-3 mb-3">
-                <div className="text-xs text-gray-400 mb-0.5">Contract address</div>
+              <div className="bg-white/50 rounded-xl p-3 mb-3">
+                <div className="text-xs text-gray-500 mb-0.5">Contract address</div>
                 <div className="font-mono text-xs text-gray-700 truncate">{info.tokenAddress}</div>
               </div>
 
-              <div className="bg-green-100/80 rounded-xl px-4 py-2.5 text-center">
-                <div className="text-xs text-green-600 font-medium">Chain</div>
-                <div className="font-bold text-sm text-gray-900">
+              <div className="flex items-center justify-center gap-2">
+                <span className={`w-5 h-5 rounded-full flex items-center justify-center text-white text-[10px] font-bold ${infoIcon}`}>
+                  {(srcKey || "?").charAt(0)}
+                </span>
+                <span className="font-bold text-sm text-gray-900">
                   {SUPPORTED_CHAINS[currentChainId]?.name || customChain?.name || `ID: ${currentChainId}`}
-                </div>
+                </span>
               </div>
             </div>
+              );
+            })()}
 
             {/* Amount to bridge */}
             <div>
@@ -1168,8 +1252,8 @@ const tryWithFallback = async (chainId, fn) => {
                   <span className="font-semibold text-gray-800">{balance}</span>
                 )}
                 {info && !balanceLoading && (
-                  <button onClick={() => refreshBalance(info.token, info.decimals)} title="Refresh balance" className="ml-1 text-green-500 hover:text-green-700 transition">
-                    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h5M20 20v-5h-5M5.6 15.4A8 8 0 0118.4 8.6M18.4 8.6A8 8 0 015.6 15.4"/></svg>
+                  <button onClick={() => refreshBalance(info.tokenAddress, info.decimals)} title="Refresh balance" className="ml-1 text-green-500 hover:text-green-700 transition">
+                    <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M21.5 2v6h-6M2.5 22v-6h6M2.5 11.5a10 10 0 0117.68-5.5M21.5 12.5a10 10 0 01-17.68 5.5"/></svg>
                   </button>
                 )}</p>
               </div>
@@ -1183,13 +1267,13 @@ const tryWithFallback = async (chainId, fn) => {
                 />
                 <div className="flex justify-center gap-4 mt-3">
                   <button
-                    onClick={() => setAmount(String((parseFloat(balance) * 0.5).toFixed(6)))}
+                    onClick={() => { const v = parseFloat(balance) * 0.5; setAmount(String(Math.floor(v * 1e5) / 1e5)); }}
                     className="text-sm font-medium text-green-600 hover:text-green-700 transition"
                   >
                     50%
                   </button>
                   <button
-                    onClick={() => setAmount(balance)}
+                    onClick={() => { const v = parseFloat(balance); setAmount(String(Math.floor(v * 1e5) / 1e5)); }}
                     className="text-sm font-medium text-green-600 hover:text-green-700 transition"
                   >
                     Max
@@ -1201,54 +1285,51 @@ const tryWithFallback = async (chainId, fn) => {
             {/* Destination */}
             <div>
               <p className="text-sm text-gray-500 mb-2">Destination</p>
-              <div className="border border-gray-200 rounded-xl divide-y divide-gray-100">
-                {/* Network row */}
-                <div className="flex items-center justify-between px-4 py-3">
-                  <span className="text-sm text-gray-400">Network</span>
-                  <div className="flex items-center gap-2">
-                    <span className="w-3 h-3 rounded-full bg-blue-500"></span>
-                    <select
-                      value={dstChain}
-                      onChange={(e) => {
-                        const chain = e.target.value;
-                        if (chain === "Custom") {
-                          setDstChain("Custom");
-                        } else {
-                          const newVal = CHAINS[chain];
-                          setDstChain(chain);
-                          setSendParams((prev) => prev ? ({ ...prev, dstEid: newVal }) : prev);
-                        }
-                      }}
-                      className="bg-transparent text-sm font-semibold text-gray-800 outline-none cursor-pointer"
-                    >
-                      {Object.keys(CHAINS).filter(c => c !== "Custom").map((c) => (
-                        <option key={c} value={c}>{c}</option>
-                      ))}
-                      <option value="Custom">Custom</option>
-                    </select>
-                    {dstChain === "Custom" && (
-                      <input
-                        type="number"
-                        placeholder="EID"
-                        value={sendParams?.dstEid ?? ""}
-                        onChange={(e) => {
-                          setSendParams((prev) => prev ? ({ ...prev, dstEid: e.target.value }) : prev);
-                        }}
-                        className="w-20 border border-gray-200 px-2 py-1 rounded-lg text-sm text-right focus:outline-none"
-                      />
-                    )}
-                    {dstChain !== "Custom" && (
-                      <span className="text-xs text-gray-400">EID: {sendParams?.dstEid}</span>
-                    )}
-                  </div>
+              <div className={`rounded-xl px-4 py-3 text-center ${
+                ({Ethereum:"bg-blue-100/80",BSC:"bg-yellow-100/80",Polygon:"bg-purple-100/80",Avalanche:"bg-red-100/80",Arbitrum:"bg-sky-100/80",Optimism:"bg-red-50",Base:"bg-blue-200/80",Sonic:"bg-indigo-100/80",Solana:"bg-gradient-to-r from-purple-100/80 to-green-100/80"})[dstChain] || "bg-gray-100/80"
+              }`}>
+                <div className="flex items-center justify-center gap-2 mb-1">
+                  <span className={`w-5 h-5 rounded-full flex items-center justify-center text-white text-[10px] font-bold ${
+                    ({Ethereum:"bg-blue-500",BSC:"bg-yellow-500",Polygon:"bg-purple-500",Avalanche:"bg-red-500",Arbitrum:"bg-sky-500",Optimism:"bg-red-400",Base:"bg-blue-600",Sonic:"bg-indigo-500",Solana:"bg-purple-600"})[dstChain] || "bg-gray-400"
+                  }`}>
+                    {(dstChain || "?").charAt(0)}
+                  </span>
+                  <select
+                    value={dstChain}
+                    onChange={(e) => {
+                      const chain = e.target.value;
+                      if (chain === "Custom") {
+                        setDstChain("Custom");
+                      } else {
+                        const newVal = CHAINS[chain];
+                        setDstChain(chain);
+                        setDstEidValue(newVal);
+                        setSendParams((prev) => prev ? ({ ...prev, dstEid: newVal }) : prev);
+                        updateUrl({ dstEid: newVal });
+                      }
+                    }}
+                    className="bg-transparent font-bold text-sm text-gray-900 outline-none cursor-pointer"
+                  >
+                    {Object.keys(CHAINS).filter(c => c !== "Custom").map((c) => (
+                      <option key={c} value={c}>{c}</option>
+                    ))}
+                    <option value="Custom">Custom</option>
+                  </select>
                 </div>
-
-                {/* Recipient address row */}
-                <div className="px-4 py-3">
-                  <div className="text-xs text-gray-400 mb-1">Recipient address</div>
-                  <div className="font-mono text-xs text-gray-600 truncate border border-gray-100 rounded-lg px-3 py-2 bg-gray-50">
-                    {sendParams?.to || "\u2014"}
-                  </div>
+                <div className="flex items-center justify-center gap-2">
+                  {dstChain === "Custom" ? (
+                    <input
+                      type="number"
+                      placeholder="EID"
+                      value={sendParams?.dstEid ?? ""}
+                      onChange={(e) => {
+                        setSendParams((prev) => prev ? ({ ...prev, dstEid: e.target.value }) : prev);
+                      }}
+                      className="w-24 border border-gray-200 px-2 py-1 rounded-lg text-xs text-center font-mono bg-white focus:outline-none"
+                    />
+                  ) : (
+                    <span className="text-xs text-gray-500">EID: {sendParams?.dstEid || dstEidValue}</span>
+                  )}
                 </div>
               </div>
             </div>
@@ -1343,6 +1424,92 @@ const tryWithFallback = async (chainId, fn) => {
           </>
         )}
       </div>
+
+      {/* ====== RIGHT PANEL — Transaction History ====== */}
+        <div className="w-full lg:w-[360px] flex-shrink-0 self-start bg-white rounded-2xl shadow-sm border border-gray-100 p-4">
+          <button
+            onClick={() => setShowTxHistory(!showTxHistory)}
+            className="w-full flex items-center justify-between"
+          >
+            <div className="flex items-center gap-2">
+              <svg className="w-5 h-5 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              <h3 className="text-base font-bold text-gray-900">History</h3>
+              <span className="text-xs text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded-full">{txHistory.length}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              {txHistory.length > 0 && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (window.confirm("Clear all transaction history?")) {
+                    setTxHistory([]);
+                    localStorage.removeItem("lz_tx_history");
+                    setAlert({ type: "info", message: "History cleared" });
+                  }
+                }}
+                className="text-xs text-red-400 hover:text-red-600 transition"
+              >
+                Clear
+              </button>
+              )}
+              <svg className={`w-4 h-4 text-gray-400 transition-transform duration-200 ${showTxHistory ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+              </svg>
+            </div>
+          </button>
+          {showTxHistory && (
+            <div className="mt-3 flex flex-col gap-2 max-h-[60vh] overflow-y-auto">
+              {txHistory.map((tx, i) => {
+                const timeAgo = (() => {
+                  const diff = Date.now() - tx.timestamp;
+                  const mins = Math.floor(diff / 60000);
+                  if (mins < 1) return "just now";
+                  if (mins < 60) return `${mins}m ago`;
+                  const hrs = Math.floor(mins / 60);
+                  if (hrs < 24) return `${hrs}h ago`;
+                  const days = Math.floor(hrs / 24);
+                  return `${days}d ago`;
+                })();
+                return (
+                  <a
+                    key={tx.hash + i}
+                    href={`https://layerzeroscan.com/tx/${tx.hash}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-3 px-3 py-3 bg-gray-50 border border-gray-100 rounded-xl hover:bg-blue-50 hover:border-blue-200 transition group"
+                  >
+                    <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${
+                      tx.status === "success" ? "bg-green-100 text-green-600" : "bg-red-100 text-red-500"
+                    }`}>
+                      {tx.status === "success" ? (
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                        </svg>
+                      ) : (
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2.5">
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      )}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-semibold text-gray-800 truncate">{tx.amount} {tx.symbol}</span>
+                        <span className="text-xs text-gray-400 flex-shrink-0 ml-2">{timeAgo}</span>
+                      </div>
+                      <div className="text-xs text-gray-400 mt-0.5">{tx.srcChain} → {tx.dstChain}</div>
+                      <div className="font-mono text-xs text-gray-400 group-hover:text-blue-500 transition mt-0.5">{tx.hash.slice(0,6)}...{tx.hash.slice(-6)}</div>
+                    </div>
+                  </a>
+                );
+              })}
+            </div>
+          )}
+          {txHistory.length === 0 && showTxHistory && (
+            <div className="mt-3 text-center py-6 text-sm text-gray-400">No transactions yet</div>
+          )}
+        </div>
 
       <OftScanner
         show={showOftScanner}
@@ -1495,6 +1662,13 @@ const tryWithFallback = async (chainId, fn) => {
                         if (route.extraOptions) {
                           localStorage.setItem("lz_extraOptions", route.extraOptions);
                         }
+                        // Sync URL to the loaded route
+                        updateUrl({
+                          oftadr: route.oftAddress,
+                          chainId: route.chainId,
+                          dstEid: route.dstEid || (route.dstChain ? CHAINS[route.dstChain] : undefined),
+                          extraOp: route.extraOptions,
+                        });
                         setShowSavedRoutes(false);
                         setAlert({ type: "info", message: `Route loaded: ${route.name || route.symbol || route.oftAddress.slice(0,10)}` });
                         setInfo(null);
