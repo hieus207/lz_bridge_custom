@@ -102,7 +102,7 @@ async function fetchWormholeSources() {
   const [portal, scan] = await Promise.allSettled([
     wormholePortalCache
       ? Promise.resolve(wormholePortalCache)
-      : fetch(proxied("https://portalbridge.com/_next/static/chunks/51c19307a7942953.js"))
+      : fetch(proxied("https://portalbridge.com/_next/static/chunks/0642106cdfad66c3.js"))
           .then(r => { if (!r.ok) throw new Error(`Portal Bridge ${r.status}`); return r.text(); })
           .then(t => { wormholePortalCache = t; return t; }),
     wormholeScanCache
