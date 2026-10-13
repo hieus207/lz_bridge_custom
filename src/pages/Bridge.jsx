@@ -4,7 +4,8 @@ import BridgeButton from "../components/BridgeButton";
 import { X } from "lucide-react";
 
 function Bridge() {
-  const { address, connect, disconnect, signer } = useWallet();
+  const wallet = useWallet();
+  const { address, connect, disconnect, signer } = wallet;
   const [showModal, setShowModal] = useState(false);
 
   const handleConnect = (type) => {
@@ -16,7 +17,7 @@ function Bridge() {
     <div className="min-h-screen flex items-start justify-center bg-[#f5f0e6] font-sans px-4 py-8">
       <div className="w-full max-w-7xl">
         {address ? (
-          <BridgeButton signer={signer} address={address} disconnect={disconnect} />
+          <BridgeButton signer={signer} address={address} disconnect={disconnect} wallet={wallet} />
         ) : (
           <div className="w-full max-w-md mx-auto bg-white rounded-2xl shadow-lg overflow-hidden p-6">
             <h1 className="text-xl font-bold text-gray-900 mb-6 text-center">LZ Bridge</h1>

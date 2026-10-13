@@ -4,7 +4,8 @@ import NexusButton from "../components/NexusButton";
 import { LogOut, X } from "lucide-react";
 
 function Nexus() {
-  const { address, connect, disconnect, signer } = useWallet();
+  const wallet = useWallet();
+  const { address, connect, disconnect, signer } = wallet;
   const [showModal, setShowModal] = useState(false);
 
   const handleConnect = (type) => {
@@ -40,7 +41,7 @@ function Nexus() {
               </button>
             </div>
 
-            <NexusButton signer={signer} />
+            <NexusButton signer={signer} wallet={wallet} />
           </div>
         ) : (
           <>

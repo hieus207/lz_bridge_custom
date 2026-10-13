@@ -1,33 +1,14 @@
 import { useState, useEffect } from "react";
 import { ethers } from "ethers";
+import { discoverHolders } from "../lib/holders";
+import { probeContracts, classify } from "../lib/onchain";
 
-// OKLink chain slugs (matches oklink.com/<slug>)
-const OKLINK_CHAINS = {
-  1:     "eth",
-  56:    "bsc",
-  137:   "polygon",
-  43114: "avax-c",
-  42161: "arbitrum-one",
-  10:    "optimism",
-  8453:  "base",
-};
-
-// Proxy server URL — run `node oklink-proxy.mjs` alongside the dev server
-// Change to your deployed URL in production
+// OKLink proxy is optional now: holder discovery falls back to public APIs and
+// on-chain log scanning when it is down or not running.
 const OKLINK_PROXY = process.env.REACT_APP_OKLINK_PROXY ||
   (process.env.NODE_ENV === "development" ? "http://localhost:3001" : "");
 
-const OFT_CHECK_ABI = [
-  "function token() view returns (address)",
-  "function endpoint() view returns (address)",
-  "function oftVersion() view returns (bytes4 interfaceId, uint64 version)",
-];
-
-const ERC20_ABI = [
-  "function totalSupply() view returns (uint256)",
-  "function decimals() view returns (uint8)",
-  "function balanceOf(address) view returns (uint256)",
-];
+const lc = (a) => a.toLowerCase();
 
 const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvider, chainRpcs, initialToken }) => {
   const [tokenAddress, setTokenAddress] = useState("");
@@ -50,8 +31,6 @@ const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvid
 
   if (!show) return null;
 
-  const oklinkChain = OKLINK_CHAINS[chainId];
-
   const getProvider = () => {
     if (externalProvider) return externalProvider;
     const rpcs = chainRpcs?.[chainId];
@@ -59,142 +38,20 @@ const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvid
     return null;
   };
 
-  const checkCandidatesForOFT = async (candidates, p, targetToken) => {
-    if (candidates.length === 0) {
-      setStatus("done");
-      setProgress("No contract holders found in range");
-      return;
-    }
-
-    const CONCURRENCY = 8;
-    const found = [];
-
-    const checkOne = async (c) => {
-      try {
-        const contract = new ethers.Contract(c.address, OFT_CHECK_ABI, p);
-
-        let linkedToken = null;
-        let isMatch = false;
-        try {
-          linkedToken = await contract.token();
-          isMatch = linkedToken.toLowerCase() === targetToken.toLowerCase();
-        } catch { /* OFT may not have token() */ }
-
-        const [endpointAddr, versionRaw] = await Promise.all([
-          contract.endpoint().catch(() => null),
-          contract.oftVersion().catch(() => null),
-        ]);
-        const version = versionRaw ? versionRaw.toString() : null;
-
-        if (!endpointAddr && !version) return null;
-
-        return {
-          address: c.address,
-          balance: c.balance,
-          percentage: c.percentage,
-          decimals: c.decimals,
-          linkedToken,
-          isTokenMatch: isMatch,
-          endpoint: endpointAddr,
-          version,
-        };
-      } catch {
-        return null;
-      }
-    };
-
-    // Run in concurrent batches
-    for (let i = 0; i < candidates.length; i += CONCURRENCY) {
-      const batch = candidates.slice(i, i + CONCURRENCY);
-      setProgress(`Checking OFT ${i + 1}–${Math.min(i + CONCURRENCY, candidates.length)}/${candidates.length}...`);
-      const results = await Promise.all(batch.map(checkOne));
-      for (const r of results) {
-        if (r) found.push(r);
-      }
-    }
-
-    setResults(found);
-    setStatus("done");
-    setProgress(found.length === 0
-      ? "No OFT contracts found among top holders"
-      : `Found ${found.length} OFT contract(s)!`
-    );
-  };
-
-  const scanViaTransfers = async (p, tokenAddr) => {
-    setProgress("Holder API unavailable, scanning transfer events...");
-
-    const tokenContract = new ethers.Contract(tokenAddr, ERC20_ABI, p);
-
-    let totalSupply, decimals;
-    try {
-      [totalSupply, decimals] = await Promise.all([
-        tokenContract.totalSupply(),
-        tokenContract.decimals(),
-      ]);
-    } catch {
-      throw new Error("Cannot read token supply. Is this a valid ERC-20?");
-    }
-
-    const transferTopic = ethers.id("Transfer(address,address,uint256)");
-    const latestBlock = await p.getBlockNumber();
-    const fromBlock = Math.max(0, latestBlock - 100000);
-
-    setProgress("Fetching transfer logs (last ~100k blocks)...");
-    const logs = await p.getLogs({
-      address: tokenAddr,
-      topics: [transferTopic],
-      fromBlock,
-      toBlock: latestBlock,
-    });
-
-    const addressSet = new Set();
-    for (const log of logs) {
-      if (log.topics[2]) {
-        const addr = "0x" + log.topics[2].slice(26);
-        if (addr !== "0x0000000000000000000000000000000000000000") {
-          addressSet.add(ethers.getAddress(addr));
-        }
-      }
-    }
-
-    setProgress(`Found ${addressSet.size} addresses, checking balances & contracts...`);
-
-    const candidates = [];
-    const addresses = Array.from(addressSet);
-
-    // Parallel getCode + balanceOf in batches of 10
-    for (let i = 0; i < addresses.length; i += 10) {
-      const batch = addresses.slice(i, i + 10);
-      setProgress(`Checking ${Math.min(i + 10, addresses.length)}/${addresses.length} addresses...`);
-
-      const batchResults = await Promise.all(
-        batch.map(async (addr) => {
-          const [code, bal] = await Promise.all([
-            p.getCode(addr),
-            tokenContract.balanceOf(addr),
-          ]);
-          if (code === "0x") return null;
-          const pct = Number(bal * ethers.toBigInt(10000) / totalSupply) / 100;
-          if (pct < 0.2 || pct > 15) return null;
-          return { address: addr, balance: bal, percentage: pct, decimals: Number(decimals) };
-        })
-      );
-
-      for (const r of batchResults) {
-        if (r) candidates.push(r);
-      }
-    }
-
-    setProgress(`Found ${candidates.length} contract holders, checking OFT...`);
-    await checkCandidatesForOFT(candidates, p, tokenAddr);
-  };
+  const toResult = (f, probe, extra = {}) => ({
+    address: f.address,
+    percentage: extra.pct ?? null,
+    linkedToken: probe?.token || null,
+    isTokenMatch: f.confidence === "high",
+    endpoint: probe?.endpoint || null,
+    version: probe?.oftVersion ? `${probe.oftVersion[0]} v${probe.oftVersion[1]}` : null,
+    ...extra,
+  });
 
   const scan = async (overrideAddr) => {
     const addr = (overrideAddr || tokenAddress).trim();
     if (!ethers.isAddress(addr)) return;
-    if (!chainId || chainId === "custom") return;
-    if (!oklinkChain) return;
+    if (!chainId) return;
 
     setStatus("scanning");
     setResults([]);
@@ -204,116 +61,54 @@ const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvid
       const p = getProvider();
       if (!p) throw new Error("No RPC available");
 
-      // ── Step 0: check if the token contract itself is an OFT ──────────────
-      try {
-        const selfContract = new ethers.Contract(addr, OFT_CHECK_ABI, p);
-        const [endpointAddr, versionRaw] = await Promise.all([
-          selfContract.endpoint().catch(() => null),
-          selfContract.oftVersion().catch(() => null),
-        ]);
-        const version = versionRaw ? versionRaw.toString() : null;
-
-        if (endpointAddr || version) {
-          let linkedToken = null;
-          let isMatch = false;
-          try {
-            linkedToken = await selfContract.token();
-            isMatch = linkedToken.toLowerCase() === addr.toLowerCase();
-          } catch { isMatch = true; /* token IS the OFT */ }
-
-          setResults([{
-            address: addr,
-            balance: "—",
-            percentage: 100,
-            decimals: -1,
-            linkedToken,
-            isTokenMatch: isMatch,
-            endpoint: endpointAddr,
-            version,
-            isSelf: true,
-          }]);
-          setStatus("done");
-          setProgress("Token contract itself is an OFT!");
-          return;
-        }
-      } catch { /* not OFT, continue to holder scan */ }
-
-      // ── Step 1: scan top holders via OKLink ───────────────────────────────
-      setProgress("Fetching top holders via OKLink...");
-
-      const proxyUrl = `${OKLINK_PROXY}/api/holders/${oklinkChain}/${addr}?offset=0&limit=50&sort=value%2Cdesc`;
-      const resp = await fetch(proxyUrl);
-      if (!resp.ok) throw new Error(`Proxy error: ${resp.status}`);
-      const json = await resp.json();
-
-      const code = json.code;
-      const ok   = code === 0 || code === "0";
-
-      if (!ok) {
-        console.warn("OKLink API failed:", json);
-        await scanViaTransfers(p, addr);
+      // ── Step 0: is the token contract itself an OFT? ──
+      const self = await probeContracts(p, [addr]);
+      const selfProbe = self.get(lc(addr));
+      const selfLz = classify(addr, selfProbe, addr, { chainId }).filter((f) => f.protocol === "LayerZero");
+      if (selfLz.length) {
+        setResults([toResult(selfLz[0], selfProbe, { isSelf: true, isTokenMatch: true })]);
+        setStatus("done");
+        setProgress("Token contract itself is an OFT!");
         return;
       }
 
-      const d       = json.data || {};
-      const rawList = d.hits || d.holderList || [];
-
-      if (rawList.length === 0) {
-        await scanViaTransfers(p, addr);
+      // ── Step 1: holders (API → OKLink → on-chain logs) ──
+      const { holders, source, attempts } = await discoverHolders({
+        provider: p,
+        chainId,
+        token: addr,
+        proxyBase: OKLINK_PROXY,
+        fallbackRpcs: (chainRpcs?.[chainId] || []).filter((u) => u !== p._getConnection?.().url),
+        onProgress: setProgress,
+      });
+      if (!holders.length) {
+        setStatus("done");
+        setProgress(`No holders found (${attempts.map((a) => `${a.source}: ${a.error}`).join("; ")})`);
         return;
       }
 
-      setProgress(`Got ${rawList.length} holders from OKLink, filtering...`);
-
-      // rate is 0-1 fraction → pct = rate * 100
-      const holders = rawList
-        .filter(h => {
-          const pct = parseFloat(h.rate ?? 0) * 100;
-          return pct >= 0.2 && pct <= 15;
-        })
-        .map(h => ({
-          address:    ethers.getAddress(h.holderAddress),
-          balance:    h.value,
-          percentage: parseFloat(h.rate ?? 0) * 100,
-          decimals:   -1,
-        }));
-
-      setProgress(`Found ${holders.length} holders in 0.2%-15% range, checking contracts...`);
-
-      // Check getCode for all holders concurrently (batches of 10)
-      const contractHolders = [];
-      for (let i = 0; i < holders.length; i += 10) {
-        const batch = holders.slice(i, i + 10);
-        const codeResults = await Promise.all(
-          batch.map(async (c) => {
-            const code = await p.getCode(c.address);
-            return code !== "0x" ? c : null;
-          })
-        );
-        for (const r of codeResults) {
-          if (r) contractHolders.push(r);
+      // ── Step 2: fingerprint every holder in one batched pass ──
+      setProgress(`Got ${holders.length} addresses via ${source}, checking OFT interface...`);
+      const probes = await probeContracts(p, holders.map((h) => h.address));
+      const found = [];
+      for (const h of holders) {
+        const probe = probes.get(lc(h.address));
+        for (const f of classify(h.address, probe, addr, { chainId, holder: h })) {
+          if (f.protocol === "LayerZero") found.push(toResult(f, probe, { pct: h.pct }));
         }
       }
+      found.sort((a, b) => Number(b.isTokenMatch) - Number(a.isTokenMatch));
 
-      setProgress(`Found ${contractHolders.length} contract holders, checking OFT...`);
-      await checkCandidatesForOFT(contractHolders, p, addr);
-
+      setResults(found);
+      setStatus("done");
+      setProgress(found.length === 0
+        ? `No OFT contracts found among ${holders.length} addresses (via ${source})`
+        : `Found ${found.length} OFT contract(s) via ${source}!`
+      );
     } catch (err) {
       console.error("OFT scan error:", err);
       setStatus("error");
       setProgress(err.message || "Scan failed");
-    }
-  };
-
-  const formatBalance = (bal, dec) => {
-    try {
-      // dec === -1 → balance is already a human-readable float (from OKLink)
-      const num = dec === -1 ? Number(bal) : parseFloat(ethers.formatUnits(bal, dec));
-      if (num > 1e6) return (num / 1e6).toFixed(2) + "M";
-      if (num > 1e3) return (num / 1e3).toFixed(2) + "K";
-      return num.toFixed(2);
-    } catch {
-      return "?";
     }
   };
 
@@ -349,17 +144,17 @@ const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvid
 
           {/* Info */}
           <div className="text-xs text-gray-400 bg-gray-50 rounded-lg px-3 py-2">
-            Scans top holders (0.2%–15% supply) that are <strong>contracts</strong>, then checks each for OFT interface (OKLink API + RPC).{!oklinkChain && <span className="text-orange-500 ml-1">⚠ Chain not supported yet.</span>}
+            Takes the top 50 <strong>contract</strong> holders by balance (explorer APIs, OKLink, or on-chain logs as fallback), then checks each for the OFT interface.
           </div>
 
           {/* Scan button */}
           <button
-            onClick={scan}
-            disabled={status === "scanning" || !ethers.isAddress(tokenAddress.trim()) || !oklinkChain}
+            onClick={() => scan()}
+            disabled={status === "scanning" || !ethers.isAddress(tokenAddress.trim())}
             className={`w-full py-2.5 font-semibold rounded-xl transition text-sm ${
               status === "scanning"
                 ? "bg-gray-200 text-gray-500 cursor-wait"
-                : !oklinkChain
+                : !ethers.isAddress(tokenAddress.trim())
                 ? "bg-gray-100 text-gray-400 cursor-not-allowed"
                 : "bg-gray-900 text-white hover:bg-gray-800"
             }`}
@@ -410,14 +205,16 @@ const OftScanner = ({ show, onClose, onSelect, chainId, provider: externalProvid
                   <div className="flex items-center gap-3 text-xs text-gray-500">
                     {r.isSelf
                       ? <span className="italic">This token is the OFT contract</span>
-                      : <span>Holds: {formatBalance(r.balance, r.decimals)} ({r.percentage.toFixed(2)}%)</span>
+                      : <span>Holds: {r.percentage != null ? `${r.percentage.toFixed(2)}% of supply` : "?"}</span>
                     }
                     {r.endpoint && <span>Endpoint: {r.endpoint.slice(0, 8)}...</span>}
                     {r.version && <span>Ver: {r.version}</span>}
                   </div>
-                  <div className="text-[10px] text-gray-400">
-                    token() → {r.linkedToken}
-                  </div>
+                  {r.linkedToken && (
+                    <div className="text-[10px] text-gray-400">
+                      token() → {r.linkedToken}
+                    </div>
+                  )}
                 </div>
               ))}
               <p className="text-[10px] text-gray-400 text-center mt-1">Click a result to use it as OFT contract</p>

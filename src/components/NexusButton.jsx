@@ -24,7 +24,7 @@ const SUPPORTED_CHAINS = {
   8453: { name: "Base", hex: "0x2105" },
 };
 
-const NexusButton = ({ signer }) => {
+const NexusButton = ({ signer, wallet }) => {
   const [nexusAddress, setNexusAddress] = useState("");
   const [amount, setAmount] = useState("5");
   const [dstChain, setDstChain] = useState("Ethereum");
@@ -64,7 +64,7 @@ const NexusButton = ({ signer }) => {
     }
 
     const chainIdParam = params.get("chainId");
-    if (chainIdParam && window.ethereum) {
+    if (chainIdParam) {
       const parsed = parseInt(chainIdParam, 10);
       if (!isNaN(parsed)) {
         const chain = SUPPORTED_CHAINS[parsed];
@@ -92,6 +92,8 @@ const NexusButton = ({ signer }) => {
       setRecipientAddress(recipientParam);
       setNexusParams((prev) => ({ ...prev, humanRecipient: recipientParam }));
     }
+    // Mount-only: read URL params once
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Provider setup
@@ -100,37 +102,25 @@ const NexusButton = ({ signer }) => {
       if (useCustomRpc && customRpcUrl) {
         const customProvider = new ethers.JsonRpcProvider(customRpcUrl);
         setProvider(customProvider);
-      } else if (signer) {
-        const signerProvider = signer.provider;
-        setProvider(signerProvider);
+      } else if (wallet?.walletProvider) {
+        setProvider(new ethers.BrowserProvider(wallet.walletProvider, "any"));
       }
     };
     setupProvider();
-  }, [signer, useCustomRpc, customRpcUrl]);
+  }, [wallet?.walletProvider, useCustomRpc, customRpcUrl]);
 
-  // Track chain ID
+  // Track chain ID — wallet chain changes come from useWallet (no listener leaks here)
   useEffect(() => {
-    if (provider) {
-      provider.getNetwork().then((network) => {
+    if (useCustomRpc) {
+      provider?.getNetwork().then((network) => {
         setCurrentChainId(Number(network.chainId));
         setCurrentChain(SUPPORTED_CHAINS[Number(network.chainId)]?.name || "Unknown");
-      });
-
-      if (window.ethereum && !useCustomRpc) {
-        window.ethereum.on("chainChanged", async () => {
-          // Recreate provider when chain changes
-          const newProvider = new ethers.BrowserProvider(window.ethereum);
-          setProvider(newProvider);
-          
-          // Update chain info
-          const network = await newProvider.getNetwork();
-          const chainId = Number(network.chainId);
-          setCurrentChainId(chainId);
-          setCurrentChain(SUPPORTED_CHAINS[chainId]?.name || "Unknown");
-        });
-      }
+      }).catch(() => {});
+    } else if (wallet?.chainId) {
+      setCurrentChainId(wallet.chainId);
+      setCurrentChain(SUPPORTED_CHAINS[wallet.chainId]?.name || "Unknown");
     }
-  }, [provider, useCustomRpc]);
+  }, [provider, useCustomRpc, wallet?.chainId]);
 
   // Update dst chain ID and params
   useEffect(() => {
@@ -194,10 +184,7 @@ const NexusButton = ({ signer }) => {
   // Switch chain
   async function switchChain(chainIdHex) {
     try {
-      await window.ethereum.request({
-        method: "wallet_switchEthereumChain",
-        params: [{ chainId: chainIdHex }],
-      });
+      await wallet.switchChain(parseInt(chainIdHex, 16));
       const chainName = SUPPORTED_CHAINS[parseInt(chainIdHex, 16)]?.name || "Chain";
       setAlert({ type: "info", message: `Switched to ${chainName}` });
     } catch (err) {
@@ -244,10 +231,11 @@ const NexusButton = ({ signer }) => {
   async function approveToken(tokenAddress, spender, amount, decimals) {
     try {
       setLoading(true);
+      const txSigner = await wallet.getSigner(currentChainId);
       const tokenContract = new ethers.Contract(
         tokenAddress,
         ["function approve(address,uint256) returns (bool)"],
-        signer
+        txSigner
       );
 
       const amountWei = ethers.parseUnits(amount, decimals);
@@ -279,8 +267,8 @@ const NexusButton = ({ signer }) => {
       let currentProvider;
       if (useCustomRpc && customRpcUrl) {
         currentProvider = new ethers.JsonRpcProvider(customRpcUrl);
-      } else if (window.ethereum) {
-        currentProvider = new ethers.BrowserProvider(window.ethereum);
+      } else if (wallet?.walletProvider) {
+        currentProvider = new ethers.BrowserProvider(wallet.walletProvider);
       } else {
         setAlert({ type: "error", message: "No provider available" });
         setLoading(false);
@@ -389,19 +377,22 @@ const NexusButton = ({ signer }) => {
       return;
     }
 
-    // Recreate provider to ensure correct chain (same as handleCheck)
-    let currentProvider;
-    if (useCustomRpc && customRpcUrl) {
-      currentProvider = new ethers.JsonRpcProvider(customRpcUrl);
-    } else if (window.ethereum) {
-      currentProvider = new ethers.BrowserProvider(window.ethereum);
-    } else {
-      setAlert({ type: "error", message: "No provider available" });
+    if (!currentChainId) {
+      setAlert({ type: "error", message: "Unknown source chain — check the contract first" });
       return;
     }
 
-    // Get fresh signer from new provider
-    const freshSigner = await currentProvider.getSigner();
+    // Fresh signer on the source chain (switches + verifies the wallet's network first)
+    let freshSigner;
+    try {
+      freshSigner = await wallet.getSigner(currentChainId);
+    } catch (err) {
+      setAlert({ type: "error", message: err.message.substring(0, 160) });
+      return;
+    }
+    const currentProvider = useCustomRpc && customRpcUrl
+      ? new ethers.JsonRpcProvider(customRpcUrl)
+      : freshSigner.provider;
 
     // Recreate contract with fresh signer on current chain
     const contractWithSigner = new ethers.Contract(nexusAddress, nexusAbi, freshSigner);
@@ -482,8 +473,8 @@ const NexusButton = ({ signer }) => {
       }
 
       // Check native balance
-      const userAddress = await signer.getAddress();
-      const nativeBalance = await signer.provider.getBalance(userAddress);
+      const userAddress = await freshSigner.getAddress();
+      const nativeBalance = await freshSigner.provider.getBalance(userAddress);
       const nativeBalanceFormatted = ethers.formatEther(nativeBalance);
 
       console.log("Native balance:", nativeBalanceFormatted);

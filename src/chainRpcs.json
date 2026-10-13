@@ -1,44 +1,43 @@
 {
   "1": [
-    "https://eth.llamarpc.com",
+    "https://ethereum-rpc.publicnode.com",
+    "https://rpc.mevblocker.io",
     "https://ethereum-json-rpc.stakely.io",
-    "https://eth.meowrpc.com",
-    "https://ethereum-rpc.publicnode.com"
+    "https://eth.drpc.org"
   ],
   "56": [
+    "https://bsc-rpc.publicnode.com",
     "https://bsc-dataseed.binance.org",
     "https://bsc-dataseed1.defibit.io",
-    "https://bsc-dataseed1.ninicoin.io",
-    "https://bsc.publicnode.com"
+    "https://1rpc.io/bnb"
   ],
   "137": [
-    "https://polygon-rpc.com",
-    "https://rpc.ankr.com/polygon",
-    "https://polygon.llamarpc.com",
-    "https://polygon-bor-rpc.publicnode.com"
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://polygon.drpc.org",
+    "https://1rpc.io/matic"
   ],
   "43114": [
+    "https://avalanche-c-chain-rpc.publicnode.com",
     "https://api.avax.network/ext/bc/C/rpc",
-    "https://rpc.ankr.com/avalanche",
-    "https://avalanche.public-rpc.com",
-    "https://avalanche-c-chain-rpc.publicnode.com"
+    "https://avalanche.drpc.org",
+    "https://1rpc.io/avax/c"
   ],
   "42161": [
     "https://arb1.arbitrum.io/rpc",
-    "https://rpc.ankr.com/arbitrum",
-    "https://arbitrum.llamarpc.com",
-    "https://arbitrum-one-rpc.publicnode.com"
+    "https://arbitrum-one-rpc.publicnode.com",
+    "https://arbitrum.drpc.org",
+    "https://1rpc.io/arb"
   ],
   "10": [
+    "https://optimism-rpc.publicnode.com",
     "https://mainnet.optimism.io",
-    "https://rpc.ankr.com/optimism",
-    "https://optimism.llamarpc.com",
-    "https://optimism-rpc.publicnode.com"
+    "https://optimism.drpc.org",
+    "https://1rpc.io/op"
   ],
   "8453": [
-    "https://mainnet.base.org",
-    "https://base.llamarpc.com",
     "https://base-rpc.publicnode.com",
+    "https://mainnet.base.org",
+    "https://base.drpc.org",
     "https://1rpc.io/base"
   ]
 }

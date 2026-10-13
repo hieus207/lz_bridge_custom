@@ -6,6 +6,19 @@ import Alert from "./Alert";
 import SendParamsEditor from "./SendParamsEditor";
 import { LogOut } from "lucide-react";
 import OftScanner from "./OftScanner";
+import CustomChainForm from "./CustomChainForm";
+import useCustomChains from "../hooks/useCustomChains";
+import { chainName, getRpcs } from "../lib/chains";
+import { getCustomChain, loadCustomChains, removeCustomChain, probeRpc } from "../lib/customChains";
+import { makeProvider } from "../lib/onchain";
+
+// Verify an RPC really serves `chainId` (raw eth_chainId with timeout), then
+// build a provider pinned to it. ethers' own getNetwork() hangs on dead RPCs.
+const connectRpc = async (url, chainId) => {
+  const actual = await probeRpc(url);
+  if (chainId && actual !== Number(chainId)) throw new Error(`RPC is on chain ${actual}, expected ${chainId}`);
+  return makeProvider(url, actual);
+};
 
 // CoinGecko platform ID mapping
 const CGC_PLATFORMS = {
@@ -53,7 +66,7 @@ const CHAIN_RPCS = chainRpcsData;
 const RPC_TAB_LABELS = ["Def", "Fb1", "Fb2", "Fb3", "Cus"];
 const CUSTOM_RPC_INDEX = 4;
 
-const BridgeButton = ({ signer, address, disconnect }) => {
+const BridgeButton = ({ signer, address, disconnect, wallet }) => {
   const [oftAddress, setOftAddress] = useState("");
   const [amount, setAmount] = useState("0");
   const [info, setInfo] = useState(null);
@@ -66,7 +79,7 @@ const BridgeButton = ({ signer, address, disconnect }) => {
   const [currentChainId, setCurrentChainIdRaw] = useState(() => {
     try {
       const saved = localStorage.getItem("lz_current_chain");
-      if (saved === "custom") return "custom";
+      if (saved === "custom") return loadCustomChains()[0]?.id ?? null; // legacy sentinel
       const parsed = parseInt(saved, 10);
       return isNaN(parsed) ? null : parsed;
     } catch { return null; }
@@ -80,11 +93,9 @@ const BridgeButton = ({ signer, address, disconnect }) => {
   const [balance, setBalance] = useState("0");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [checking, setChecking] = useState(false);
-  const [customChain, setCustomChain] = useState(() => {
-    try { return JSON.parse(localStorage.getItem("lz_custom_chain") || "null"); } catch { return null; }
-  });
-  const [customChainInput, setCustomChainInput] = useState("");
-  const [customChainRpcInput, setCustomChainRpcInput] = useState("");
+  const customChains = useCustomChains();
+  const [showAddChain, setShowAddChain] = useState(false);
+  const isCustomChain = !!currentChainId && !SUPPORTED_CHAINS[currentChainId];
 
   // RPC fallback system
   const [rpcIndexes, setRpcIndexes] = useState(() => {
@@ -151,12 +162,11 @@ useEffect(() => {
   }
 
   const chainIdParam = params.get("chainId");
-  if (chainIdParam && window.ethereum) {
+  if (chainIdParam) {
     const parsed = parseInt(chainIdParam, 10);
     if (!isNaN(parsed)) {
-      const chain = SUPPORTED_CHAINS[parsed];
-      if (chain) {
-        switchChain(chain.hex);
+      if (SUPPORTED_CHAINS[parsed] || getCustomChain(parsed)) {
+        switchChain("0x" + parsed.toString(16));
         setCurrentChainId(parsed);
       }
     }
@@ -183,6 +193,8 @@ useEffect(() => {
     console.log("auto check enabled");
     setAutoCheck(auto);
   }
+  // Mount-only: read URL params once
+  // eslint-disable-next-line react-hooks/exhaustive-deps
 }, []);
 
 useEffect(() => {
@@ -251,8 +263,7 @@ const applyRpcTab = async (tabIndex) => {
   }
 
   try {
-    const testProvider = new ethers.JsonRpcProvider(rpcUrl);
-    await testProvider.getNetwork();
+    const testProvider = await connectRpc(rpcUrl, currentChainId);
     
     const newIndexes = { ...rpcIndexes, [currentChainId]: tabIndex };
     setRpcIndexes(newIndexes);
@@ -268,23 +279,17 @@ const applyRpcTab = async (tabIndex) => {
   }
 };
 
-// Ensure wallet is on the correct chain before sending tx
-const ensureWalletChain = async (chainId) => {
-  if (!window.ethereum) return;
-  const chain = SUPPORTED_CHAINS[chainId];
-  if (!chain) return;
-
-  try {
-    const currentHex = await window.ethereum.request({ method: "eth_chainId" });
-    const current = parseInt(currentHex, 16);
-    if (current !== chainId) {
-      await switchChain(chain.hex);
-      // Wait a bit for the wallet to settle
-      await new Promise((r) => setTimeout(r, 500));
-    }
-  } catch (err) {
-    throw new Error("Failed to switch wallet chain: " + (err?.message?.substring(0, 80) || ""));
+// Signer for sending a tx: switches the wallet to the source chain, waits until
+// the wallet really is there, and returns a fresh signer bound to it. Never sign
+// with the long-lived `signer` prop — it may still point at the previous chain.
+const getTxSigner = async () => {
+  const target = Number(currentChainId);
+  if (!target) throw new Error("No source chain selected");
+  if (wallet.chainId !== target) {
+    setAlert({ type: "info", message: `Confirm switching your wallet to ${chainName(target)}…` });
   }
+  // Custom chains: addChainParams() reads name/symbol/RPC from the saved chain.
+  return wallet.getSigner(target);
 };
 
 // Try a provider call with automatic RPC fallback
@@ -304,7 +309,7 @@ const tryWithFallback = async (chainId, fn) => {
   // Thử RPC hiện tại trước
   if (startUrl) {
     try {
-      const p = new ethers.JsonRpcProvider(startUrl);
+      const p = makeProvider(startUrl, chainId);
       return await fn(p);
     } catch (err) {
       if (err.message === "TOKEN_READ_FAIL" || err.message === "CONTRACT_NOT_FOUND") throw err;
@@ -316,7 +321,7 @@ const tryWithFallback = async (chainId, fn) => {
   for (let i = 0; i < builtIn.length; i++) {
     if (i === startIdx) continue;
     try {
-      const p = new ethers.JsonRpcProvider(builtIn[i]);
+      const p = makeProvider(builtIn[i], chainId);
       const result = await fn(p);
       // Lưu lại RPC mới
       const newIndexes = { ...rpcIndexes, [chainId]: i };
@@ -336,7 +341,7 @@ const tryWithFallback = async (chainId, fn) => {
   // Thử custom RPC cuối cùng
   if (customUrl && startIdx !== CUSTOM_RPC_INDEX) {
     try {
-      const p = new ethers.JsonRpcProvider(customUrl);
+      const p = makeProvider(customUrl, chainId);
       const result = await fn(p);
       const newIndexes = { ...rpcIndexes, [chainId]: CUSTOM_RPC_INDEX };
       setRpcIndexes(newIndexes);
@@ -356,20 +361,14 @@ const tryWithFallback = async (chainId, fn) => {
   throw new Error("All RPCs failed");
 };
 
-  async function switchChain(chainIdHex) {
+  async function switchChain(chainIdHex, opts) {
+    const id = parseInt(chainIdHex, 16);
     try {
-      await window.ethereum.request({
-        method: "wallet_switchEthereumChain",
-        params: [{ chainId: chainIdHex }],
-      });
-      try {
-        setAlert({ type: "info", message: `Chain ${SUPPORTED_CHAINS[parseInt(chainIdHex, 16)].name} switched successfully` });
-      } catch (error) {
-        setAlert({ type: "info", message: `Chain switched successfully` });
-      }
+      await wallet.switchChain(id, opts);
+      setAlert({ type: "info", message: `Wallet switched to ${SUPPORTED_CHAINS[id]?.name || `chain ${id}`}` });
     } catch (err) {
-        console.error("Switch chain error:", err);
-        setAlert({ type: "error", message: "Switch chain error: "+err.message.substring(0,100)+"..." } );
+      console.error("Switch chain error:", err);
+      setAlert({ type: "error", message: "Switch chain error: " + (err?.message || "").substring(0, 100) });
     }
   }
 
@@ -399,10 +398,8 @@ const tryWithFallback = async (chainId, fn) => {
 
   async function handleApprove(tokenAddress, spender, amount, decimals) {
     try {
-      // Ensure wallet is on correct chain before approving
-      await ensureWalletChain(currentChainId);
-
-      const token = new ethers.Contract(tokenAddress, oftAbi, signer);
+      const txSigner = await getTxSigner();
+      const token = new ethers.Contract(tokenAddress, oftAbi, txSigner);
       const amountWei = ethers.parseUnits(amount, decimals);
       const tx = await token.approve(spender, amountWei);
       setAlert({ type: "info", message: "Approving..." });
@@ -549,7 +546,7 @@ const tryWithFallback = async (chainId, fn) => {
         // Check if address itself is a native OFT (has endpoint/oftVersion but no token())
         try {
           const p = !useWalletRpc && CHAIN_RPCS[currentChainId]
-            ? new ethers.JsonRpcProvider(CHAIN_RPCS[currentChainId][0])
+            ? makeProvider(CHAIN_RPCS[currentChainId][0], currentChainId)
             : provider;
           const OFT_MINI = [
             "function endpoint() view returns (address)",
@@ -601,12 +598,11 @@ const tryWithFallback = async (chainId, fn) => {
         return;
       }
 
-      // Ensure wallet is on correct chain before sending
-      await ensureWalletChain(currentChainId);
+      const txSigner = await getTxSigner();
 
       const readOnlyContract = new ethers.Contract(oftAddress, oftAbi, provider);
-      const contract = new ethers.Contract(oftAddress, oftAbi, signer);
-      const recipient = await signer.getAddress();
+      const contract = new ethers.Contract(oftAddress, oftAbi, txSigner);
+      const recipient = await txSigner.getAddress();
 
       console.log(sendParams);
       try {
@@ -682,27 +678,14 @@ const tryWithFallback = async (chainId, fn) => {
 
   useEffect(() => {
   if (useWalletRpc) {
-    if (window.ethereum) {
-      const bp = new ethers.BrowserProvider(window.ethereum);
-      setProvider(bp);
-      bp.getNetwork().then((network) => {
-        setCurrentChainId(Number(network.chainId));
-      });
-      const handleChainChanged = (chainIdHex) => {
-        setCurrentChainId(parseInt(chainIdHex, 16));
-        setProvider(new ethers.BrowserProvider(window.ethereum));
-      };
-      window.ethereum.on("chainChanged", handleChainChanged);
-      return () => window.ethereum.removeListener("chainChanged", handleChainChanged);
-    } else {
-      setProvider(null);
-    }
+    // Chain changes are tracked by useWallet (wallet.chainId effect below).
+    setProvider(wallet.walletProvider ? new ethers.BrowserProvider(wallet.walletProvider, "any") : null);
   } else {
     // Custom RPC mode — use CHAIN_RPCS or custom
     if (currentChainId) {
       let cancelled = false;
       const savedIdx = rpcIndexes[currentChainId] || 0;
-      const rpcs = CHAIN_RPCS[currentChainId] || [];
+      const rpcs = getRpcs(currentChainId); // built-in list, or the saved custom chain's RPC
       const customUrl = customRpcs[currentChainId];
 
       // Build ordered list: saved index first, then others
@@ -718,8 +701,7 @@ const tryWithFallback = async (chainId, fn) => {
           const url = idx === CUSTOM_RPC_INDEX ? customUrl : rpcs[idx];
           if (!url) continue;
           try {
-            const p = new ethers.JsonRpcProvider(url);
-            await p.getNetwork();
+            const p = await connectRpc(url, currentChainId);
             if (cancelled) return;
             // Chỉ cập nhật nếu index khác saved → tránh re-render loop
             if (idx !== savedIdx) {
@@ -735,39 +717,36 @@ const tryWithFallback = async (chainId, fn) => {
           } catch {}
         }
         if (!cancelled) {
-          // Tất cả RPC đều lỗi
-          if (customChain?.id === currentChainId && customChain?.rpc) {
-            try {
-              const p = new ethers.JsonRpcProvider(customChain.rpc);
-              await p.getNetwork();
-              if (!cancelled) { setProvider(p); setRpcStatus("working"); }
-              return;
-            } catch {}
-          }
-          if (window.ethereum) {
-            setProvider(new ethers.BrowserProvider(window.ethereum));
+          // Tất cả RPC đều lỗi — wallet RPC is only usable if it is on the same chain
+          if (wallet.walletProvider && wallet.chainId === currentChainId) {
+            setProvider(new ethers.BrowserProvider(wallet.walletProvider, "any"));
+          } else {
+            setProvider(null);
           }
           setRpcStatus("error");
           setAlert({ type: "error", message: "All RPCs failed for this chain" });
         }
       })();
       return () => { cancelled = true; };
-    } else if (customChain?.id && customChain?.rpc && currentChainId === "custom") {
-      // Custom chain đã kết nối trước đó
-    } else if (window.ethereum) {
-      setProvider(new ethers.BrowserProvider(window.ethereum));
+    } else if (wallet.walletProvider) {
+      setProvider(new ethers.BrowserProvider(wallet.walletProvider, "any"));
     }
 
-    // Listen for wallet chain changes to sync currentChainId on first load
-    if (window.ethereum && !currentChainId) {
-      const bp = new ethers.BrowserProvider(window.ethereum);
-      bp.getNetwork().then((network) => {
-        setCurrentChainId(Number(network.chainId));
-      }).catch(() => {});
+    // First load with nothing selected: start from the wallet's chain
+    if (!currentChainId && wallet.chainId) {
+      setCurrentChainId(wallet.chainId);
     }
   }
   // eslint-disable-next-line react-hooks/exhaustive-deps
 }, [useWalletRpc, currentChainId]);
+
+  // "Use wallet RPC" mode: the source chain follows the wallet
+  useEffect(() => {
+    if (useWalletRpc && wallet.chainId && wallet.chainId !== currentChainId) {
+      setCurrentChainId(wallet.chainId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [useWalletRpc, wallet.chainId]);
 
   // Check CoinGecko listing khi có token info
   useEffect(() => {
@@ -892,91 +871,91 @@ const tryWithFallback = async (chainId, fn) => {
           <div className="border border-gray-200 rounded-xl px-3 py-2.5 flex items-center justify-between">
             <div className="flex items-center gap-2">
               <span className={`w-6 h-6 ${CHAIN_ICON_COLORS[currentChainId] || "bg-gray-400"} rounded-full flex items-center justify-center text-white text-xs font-bold`}>
-                {(SUPPORTED_CHAINS[currentChainId]?.name || customChain?.name || "?").charAt(0)}
+                {(currentChainId ? chainName(currentChainId) : "?").charAt(0)}
               </span>
               <span className="font-semibold text-sm text-gray-900">
-                {SUPPORTED_CHAINS[currentChainId]?.name || customChain?.name || "Custom"}
+                {currentChainId ? chainName(currentChainId) : "Select chain"}
               </span>
               <span className="text-xs text-gray-400">ID: {currentChainId || "?"}</span>
             </div>
             <select
-              value={SUPPORTED_CHAINS[currentChainId] ? currentChainId : "custom"}
+              value={currentChainId ?? ""}
               onChange={e => {
                 const val = e.target.value;
-                if (val === "custom") {
-                  setCustomChainInput(customChain?.id?.toString() || "");
-                  setCustomChainRpcInput(customChain?.rpc || "");
-                  setCurrentChainId("custom");
-                } else {
-                  const chainId = parseInt(val, 10);
-                  const chain = SUPPORTED_CHAINS[chainId];
-                  if (chain) {
-                    setCurrentChainId(chainId);
-                    if (useWalletRpc) {
-                      switchChain(chain.hex);
-                    }
-                  }
+                if (val === "__add") {
+                  setShowAddChain(true);
+                  return;
                 }
+                const chainId = parseInt(val, 10);
+                if (!chainId) return;
+                setShowAddChain(false);
+                setCurrentChainId(chainId);
+                // Ask the wallet to follow now; getTxSigner enforces it again at send time.
+                if (wallet.chainId !== chainId) switchChain("0x" + chainId.toString(16));
               }}
-              className="bg-transparent text-gray-400 outline-none cursor-pointer"
+              className="bg-transparent text-gray-400 outline-none cursor-pointer max-w-[7rem]"
             >
+              {!currentChainId && <option value="">Select…</option>}
               {Object.entries(SUPPORTED_CHAINS).map(([id, chain]) => (
                 <option key={id} value={id}>{chain.name}</option>
               ))}
-              <option value="custom">+ Custom</option>
+              {customChains.length > 0 && (
+                <optgroup label="Custom">
+                  {customChains.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </optgroup>
+              )}
+              {isCustomChain && !getCustomChain(currentChainId) && (
+                <option value={currentChainId}>Chain {currentChainId}</option>
+              )}
+              <option value="__add">+ Add custom chain…</option>
             </select>
           </div>
 
-          {/* Custom chain inputs */}
-          {(currentChainId === "custom" || !SUPPORTED_CHAINS[currentChainId]) && (
-            <div className="mt-2 flex flex-col gap-1.5">
-              <div className="flex gap-1.5">
-                <input
-                  type="number"
-                  placeholder="Chain ID"
-                  value={customChainInput}
-                  onChange={(e) => setCustomChainInput(e.target.value)}
-                  className="w-24 border border-gray-200 px-2 py-1.5 rounded-lg text-xs focus:outline-none focus:ring-1 focus:ring-gray-300"
-                />
-                <input
-                  type="text"
-                  placeholder="RPC URL"
-                  value={customChainRpcInput}
-                  onChange={(e) => setCustomChainRpcInput(e.target.value)}
-                  className="flex-1 border border-gray-200 px-2 py-1.5 rounded-lg text-xs font-mono focus:outline-none focus:ring-1 focus:ring-gray-300 min-w-0"
-                />
-              </div>
+          {isCustomChain && getCustomChain(currentChainId) && (
+            <div className="mt-1.5 flex items-center justify-between gap-2 text-[11px] text-gray-400">
+              <span className="font-mono truncate">{getCustomChain(currentChainId).rpc}</span>
               <button
-                onClick={async () => {
-                  const id = parseInt(customChainInput, 10);
-                  const rpc = customChainRpcInput.trim();
-                  if (!id || !rpc) {
-                    setAlert({ type: "error", message: "Enter chain ID and RPC URL" });
-                    return;
-                  }
-                  try {
-                    const p = new ethers.JsonRpcProvider(rpc);
-                    await p.getNetwork();
-                    const name = `Chain ${id}`;
-                    const cc = { id, rpc, name };
-                    setCustomChain(cc);
-                    localStorage.setItem("lz_custom_chain", JSON.stringify(cc));
-                    setCurrentChainId("custom");
-                    setCustomChainInput(id.toString());
-                    setCustomChainRpcInput(rpc);
-                    setProvider(p);
-                    setRpcStatus("working");
-                    setAlert({ type: "success", message: `Custom chain ${id} connected!` });
-                  } catch (err) {
-                    setAlert({ type: "error", message: "RPC failed: " + (err?.message?.substring(0, 60) || "") });
-                  }
+                onClick={() => {
+                  if (!window.confirm(`Remove ${chainName(currentChainId)} from saved chains?`)) return;
+                  removeCustomChain(currentChainId);
+                  setCurrentChainId(1);
                 }}
-                className="w-full py-1.5 bg-gray-800 text-white rounded-lg text-xs hover:bg-gray-700 transition"
+                className="text-red-400 hover:text-red-600 flex-shrink-0"
               >
-                Connect Chain
+                Remove
               </button>
             </div>
           )}
+
+          {showAddChain && (
+            <CustomChainForm
+              onCancel={() => setShowAddChain(false)}
+              onAdded={(c) => {
+                setShowAddChain(false);
+                setCurrentChainId(c.id);
+                setAlert({ type: "success", message: `${c.name} (chain ${c.id}) saved` });
+                if (wallet.chainId !== c.id) switchChain("0x" + c.id.toString(16));
+              }}
+            />
+          )}
+
+          {/* Wallet network vs. source chain */}
+          {(() => {
+            const target = currentChainId;
+            if (!target || !wallet.chainId || wallet.chainId === Number(target)) return null;
+            return (
+              <div className="mt-1.5 flex items-center justify-between gap-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5">
+                <span>Wallet is on {chainName(wallet.chainId)}, will switch before signing</span>
+                <button
+                  onClick={() => switchChain("0x" + Number(target).toString(16))}
+                  className="font-semibold underline underline-offset-2 hover:text-amber-900 flex-shrink-0"
+                >
+                  Switch now
+                </button>
+              </div>
+            );
+          })()}
+
         </div>
 
         {/* Token contract + Verify */}
@@ -1091,8 +1070,7 @@ const tryWithFallback = async (chainId, fn) => {
                           const url = customRpcInput.trim();
                           if (!url) return;
                           try {
-                            const p = new ethers.JsonRpcProvider(url);
-                            await p.getNetwork();
+                            const p = await connectRpc(url, currentChainId);
                             const newCustom = { ...customRpcs, [currentChainId]: url };
                             setCustomRpcs(newCustom);
                             localStorage.setItem("lz_custom_rpcs", JSON.stringify(newCustom));
@@ -1140,10 +1118,10 @@ const tryWithFallback = async (chainId, fn) => {
               </svg>
             </button>
             <span className={`w-5 h-5 ${CHAIN_ICON_COLORS[currentChainId] || "bg-gray-400"} rounded-full flex items-center justify-center text-white text-[10px] font-bold flex-shrink-0`}>
-              {(SUPPORTED_CHAINS[currentChainId]?.name || customChain?.name || "?").charAt(0)}
+              {(currentChainId ? chainName(currentChainId) : "?").charAt(0)}
             </span>
             <span className="text-sm font-semibold text-gray-800 truncate">
-              {SUPPORTED_CHAINS[currentChainId]?.name || customChain?.name || "Custom"}
+              {currentChainId ? chainName(currentChainId) : "Select chain"}
             </span>
             <span className="text-xs text-gray-400 flex-shrink-0">ID: {currentChainId || "?"}</span>
             <span className="text-gray-300">|</span>
@@ -1191,7 +1169,7 @@ const tryWithFallback = async (chainId, fn) => {
 
             {/* Token info card */}
             {(() => {
-              const srcName = SUPPORTED_CHAINS[currentChainId]?.name || customChain?.name || "";
+              const srcName = currentChainId ? chainName(currentChainId) : "";
               const srcKey = Object.keys(CHAINS).find(k => k === srcName || (k === "BSC" && srcName === "BNB")) || "";
               const infoBg = ({Ethereum:"bg-blue-100/80",BSC:"bg-yellow-100/80",Polygon:"bg-purple-100/80",Avalanche:"bg-red-100/80",Arbitrum:"bg-sky-100/80",Optimism:"bg-red-50",Base:"bg-blue-200/80",Sonic:"bg-indigo-100/80",Solana:"bg-gradient-to-r from-purple-100/80 to-green-100/80"})[srcKey] || "bg-gray-100/80";
               const infoIcon = ({Ethereum:"bg-blue-500",BSC:"bg-yellow-500",Polygon:"bg-purple-500",Avalanche:"bg-red-500",Arbitrum:"bg-sky-500",Optimism:"bg-red-400",Base:"bg-blue-600",Sonic:"bg-indigo-500",Solana:"bg-purple-600"})[srcKey] || "bg-gray-400";
@@ -1235,7 +1213,7 @@ const tryWithFallback = async (chainId, fn) => {
                   {(srcKey || "?").charAt(0)}
                 </span>
                 <span className="font-bold text-sm text-gray-900">
-                  {SUPPORTED_CHAINS[currentChainId]?.name || customChain?.name || `ID: ${currentChainId}`}
+                  {chainName(currentChainId)}
                 </span>
               </div>
             </div>
@@ -1648,7 +1626,7 @@ const tryWithFallback = async (chainId, fn) => {
                         setOftAddress(route.oftAddress);
                         if (SUPPORTED_CHAINS[route.chainId]) {
                           setCurrentChainId(route.chainId);
-                          if (useWalletRpc) switchChain(SUPPORTED_CHAINS[route.chainId].hex);
+                          if (wallet.chainId !== route.chainId) switchChain(SUPPORTED_CHAINS[route.chainId].hex);
                         } else {
                           setCurrentChainId(route.chainId);
                         }
