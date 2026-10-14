@@ -8,11 +8,18 @@ const MC_IFACE = new ethers.Interface([
   "function aggregate3((address target, bool allowFailure, bytes callData)[] calls) payable returns ((bool success, bytes returnData)[] returnData)",
 ]);
 
-export const makeProvider = (rpcUrl, chainId) =>
-  new ethers.JsonRpcProvider(rpcUrl, chainId ? Number(chainId) : undefined, {
+// ethers waits up to 300 s per request by default: a rate-limited RPC that stops answering
+// would stall the whole scan. 15 s, then the caller's fallback logic takes over.
+const RPC_TIMEOUT_MS = 15000;
+
+export const makeProvider = (rpcUrl, chainId) => {
+  const req = new ethers.FetchRequest(rpcUrl);
+  req.timeout = RPC_TIMEOUT_MS;
+  return new ethers.JsonRpcProvider(req, chainId ? Number(chainId) : undefined, {
     staticNetwork: !!chainId,
     batchMaxCount: 10, // many public RPCs reject large JSON-RPC batches
   });
+};
 
 const hasMulticall = new WeakMap();
 
@@ -197,7 +204,7 @@ export function classify(address, r, token, { chainId, tokenBridge, holder } = {
         ...(addr(r.wrappedToken) ? [["wrappedToken()", r.wrappedToken]] : []),
         ...holding,
       ],
-      bridgeLink: chainId ? `/nexus?nexusadr=${address}&chainId=${chainId}` : null,
+      bridgeLink: chainId ? `/bridge?proto=hyperlane&nexusadr=${address}&chainId=${chainId}` : null,
     });
   }
 

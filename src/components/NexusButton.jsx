@@ -12,6 +12,7 @@ const CHAINS = {
   Optimism: 10,
   Avalanche: 43114,
   Base: 8453,
+  Robinhood: 4663,
 };
 
 const SUPPORTED_CHAINS = {
@@ -22,6 +23,7 @@ const SUPPORTED_CHAINS = {
   42161: { name: "Arbitrum", hex: "0xa4b1" },
   10: { name: "Optimism", hex: "0xa" },
   8453: { name: "Base", hex: "0x2105" },
+  4663: { name: "Robinhood", hex: "0x1237" },
 };
 
 const NexusButton = ({ signer, wallet }) => {
@@ -564,21 +566,19 @@ const NexusButton = ({ signer, wallet }) => {
     <div className="space-y-4">
       {/* Nexus Contract Address */}
       <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">
-          Nexus Contract Address
-        </label>
+        <label className="label block mb-1.5">Warp route contract</label>
         <div className="flex gap-2">
           <input
             type="text"
             value={nexusAddress}
             onChange={(e) => setNexusAddress(e.target.value)}
             placeholder="0x..."
-            className="flex-1 border rounded-lg px-3 py-2 text-sm"
+            className="tile-inset flex-1 min-w-0 px-3 py-2 text-sm font-mono"
           />
           <button
             onClick={handleCheck}
             disabled={loading}
-            className="px-4 py-2 bg-blue-500 text-white rounded-lg font-medium hover:bg-blue-600 disabled:opacity-50"
+            className="btn-primary px-4 py-2 text-sm"
           >
             {loading ? "..." : "Check"}
           </button>
@@ -586,15 +586,15 @@ const NexusButton = ({ signer, wallet }) => {
       </div>
 
       {/* Custom RPC */}
-      <details className="border rounded-lg p-3">
-        <summary className="cursor-pointer font-medium text-sm">Custom RPC (Optional)</summary>
+      <details className="border-[1.5px] border-dashed border-[var(--line-2)] p-3">
+        <summary className="cursor-pointer label">Custom RPC (optional)</summary>
         <div className="mt-2 flex gap-2">
           <input
             type="text"
             value={tempRpcUrl}
             onChange={(e) => setTempRpcUrl(e.target.value)}
             placeholder="https://rpc.example.com"
-            className="flex-1 border rounded-lg px-3 py-2 text-sm"
+            className="tile-inset flex-1 min-w-0 px-3 py-2 text-sm font-mono"
           />
           <button
             onClick={applyRpc}
@@ -679,10 +679,10 @@ const NexusButton = ({ signer, wallet }) => {
               <button
                 key={chainId}
                 onClick={() => switchChain(info.hex)}
-                className={`px-3 py-1 rounded-lg text-sm font-medium transition ${
+                className={`px-3 py-1 text-[11px] font-extrabold uppercase tracking-wider transition ${
                   currentChainId === parseInt(chainId)
-                    ? "bg-purple-500 text-white"
-                    : "bg-gray-200 hover:bg-gray-300"
+                    ? "chip-on"
+                    : "border-[1.5px] border-[var(--line-2)] hover:border-[var(--line)]"
                 }`}
               >
                 {info.name}
@@ -701,10 +701,10 @@ const NexusButton = ({ signer, wallet }) => {
 
           {/* Recipient Address (optional) */}
           <div className="flex flex-col gap-1">
-            <label className="font-medium text-sm">Recipient Address (optional)</label>
+            <label className="label">Recipient Address (optional)</label>
             <input
               type="text"
-              className="border px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400 font-mono text-sm"
+              className="tile-inset px-3 py-2 font-mono text-sm"
               value={nexusParams.humanRecipient || ""}
               onChange={(e) =>
                 setNexusParams((prev) => ({ ...prev, humanRecipient: e.target.value }))
@@ -715,10 +715,10 @@ const NexusButton = ({ signer, wallet }) => {
 
           {/* Amount Input */}
           <div className="flex flex-col gap-1">
-            <label className="font-medium text-sm">Amount</label>
+            <label className="label">Amount</label>
             <input
               type="number"
-              className="border px-3 py-2 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-400"
+              className="tile-inset px-3 py-2 text-sm"
               value={nexusParams.humanAmount || ""}
               onChange={(e) =>
                 setNexusParams((prev) => ({ ...prev, humanAmount: e.target.value }))
@@ -755,7 +755,7 @@ const NexusButton = ({ signer, wallet }) => {
           <button
             onClick={handleBridge}
             disabled={loading || !nexusContract || (needsApproval && approvalRequired)}
-            className="w-full px-4 py-3 bg-gradient-to-r from-blue-500 to-cyan-500 text-white rounded-lg font-semibold hover:from-blue-600 hover:to-cyan-600 disabled:opacity-50 disabled:cursor-not-allowed"
+            className="btn-primary w-full h-12 text-sm"
           >
             {loading ? "Processing..." : "🚀 Bridge"}
           </button>

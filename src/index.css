@@ -1,17 +1,260 @@
-body {
-  margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  background-color: #f5f0e6;
-}
-
-code {
-  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
-    monospace;
-}
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/* ══════════════════════════════════════════════════════════════════════════
+   DESIGN TOKENS — "terminal brutalism" (shared look with OneSwap)
+   Flat neutral canvas, ink borders, hard offset shadows, monospace type.
+   Colour is reserved for meaning (chain tags, up/down, warnings) + one lime accent.
+   --c-* are RGB triplets so Tailwind opacity modifiers (bg-white/80) keep working.
+   ══════════════════════════════════════════════════════════════════════════ */
+:root,
+[data-theme='light'] {
+  color-scheme: light;
+  --c-surface: 247 247 245;
+  --c-sub:     239 239 236;
+  --c-hover:   226 226 223;
+  --c-line2:   207 207 203;
+  --c-line3:   181 181 176;
+  --c-faint:   138 138 135;
+  --c-muted:   92 92 90;
+  --c-ink2:    43 43 43;
+  --c-ink:     17 17 17;
+
+  --bg:       #ebebea;
+  --surface:  rgb(var(--c-surface));
+  --inset:    #ffffff;
+  --hover:    rgb(var(--c-hover));
+  --ink:      rgb(var(--c-ink));
+  --muted:    rgb(var(--c-muted));
+  --faint:    rgb(var(--c-faint));
+  --line:     #111111;
+  --line-2:   rgb(var(--c-line2));
+  --on-ink:   #f7f7f5;
+  --up:       #0f8a3c;
+  --down:     #d0302f;
+  --warn:     #b26a00;
+  --ticker-bg:#111111;
+  --ticker-fg:#f7f7f5;
+  --accent:   #c6f432;
+  --accent-ink:#111111;
+  --shadow:   #111111;
+}
+
+[data-theme='dark'] {
+  color-scheme: dark;
+  --c-surface: 22 22 22;
+  --c-sub:     28 28 28;
+  --c-hover:   38 38 38;
+  --c-line2:   46 46 46;
+  --c-line3:   64 64 64;
+  --c-faint:   111 111 108;
+  --c-muted:   163 163 160;
+  --c-ink2:    212 212 208;
+  --c-ink:     237 237 234;
+
+  --bg:       #0e0e0e;
+  --inset:    #1c1c1c;
+  --line:     #ededea;
+  --on-ink:   #111111;
+  --up:       #3ddc84;
+  --down:     #ff5f57;
+  --warn:     #f5b84a;
+  --ticker-bg:#161616;
+  --ticker-fg:#ededea;
+  --accent:   #4d6b00;
+  --accent-ink:#eef3df;
+  --shadow:   #4d6b00;
+}
+
+/* ── Base ─────────────────────────────────────────────────────────────── */
+html { background: var(--bg); }
+body {
+  margin: 0;
+  /* Transparent: <MarketBackground /> sits at z-index -10 between html and the content */
+  background-color: transparent;
+  color: var(--ink);
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+::selection { background: var(--accent); color: var(--accent-ink); }
+input, textarea, select { caret-color: var(--ink); background-color: transparent; color: inherit; }
+input::placeholder, textarea::placeholder { color: var(--faint); }
+input, .tabular, table { font-variant-numeric: tabular-nums; }
+select option, select optgroup { background: var(--inset); color: var(--ink); }
+:where(button, a, input, select, textarea, [tabindex]):focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+input:focus, textarea:focus { outline: none; border-color: var(--ink) !important; box-shadow: none !important; }
+* { scrollbar-width: thin; scrollbar-color: var(--faint) transparent; }
+
+/* ── Remaps that classes alone can't express ──────────────────────────── */
+/* Page-level cards (bg-white + rounded-2xl) become tiles: ink outline + hard offset shadow */
+.bg-white.rounded-2xl {
+  background: var(--surface) !important;
+  border: 1.5px solid var(--line) !important;
+  box-shadow: 6px 6px 0 0 var(--shadow) !important;
+}
+/* Soft shadows → hard offsets */
+.shadow-lg, .shadow-xl, .shadow-2xl, .shadow-md { box-shadow: 4px 4px 0 0 var(--line) !important; }
+.shadow-sm, .shadow { box-shadow: none !important; }
+/* Blue focus rings → ink */
+[class*='ring-blue-'] { --tw-ring-color: var(--ink) !important; }
+/* Overlays */
+[class*='bg-black/'] { background-color: rgba(0, 0, 0, 0.55) !important; }
+.bg-opacity-40.bg-black { background-color: rgba(0, 0, 0, 0.55) !important; }
+
+/* Dark mode: pastel tints (status boxes, chain cards) become dark tints.
+   Exact class names: a substring match would also catch from-purple-500 etc. */
+[data-theme='dark'] .bg-blue-50,
+[data-theme='dark'] .bg-blue-100,
+[data-theme='dark'] .bg-blue-100\/80,
+[data-theme='dark'] .bg-blue-200\/80,
+[data-theme='dark'] .bg-sky-100\/80,
+[data-theme='dark'] .bg-indigo-100\/80,
+[data-theme='dark'] .bg-purple-50,
+[data-theme='dark'] .bg-purple-100\/80,
+[data-theme='dark'] .bg-lime-100\/80,
+[data-theme='dark'] .bg-red-50,
+[data-theme='dark'] .bg-red-100,
+[data-theme='dark'] .bg-red-100\/80,
+[data-theme='dark'] .bg-yellow-50,
+[data-theme='dark'] .bg-yellow-100\/80,
+[data-theme='dark'] .bg-amber-50,
+[data-theme='dark'] .bg-green-50,
+[data-theme='dark'] .bg-green-100,
+[data-theme='dark'] .bg-emerald-50,
+[data-theme='dark'] .bg-gray-100\/80,
+[data-theme='dark'] .from-purple-50,
+[data-theme='dark'] .from-purple-100\/80 {
+  background-image: none !important;
+  background-color: var(--inset) !important;
+}
+[data-theme='dark'] [class*='text-green-7'], [data-theme='dark'] [class*='text-green-8'], [data-theme='dark'] [class*='text-green-9'],
+[data-theme='dark'] [class*='text-green-6'] { color: var(--up) !important; }
+[data-theme='dark'] [class*='text-red-6'], [data-theme='dark'] [class*='text-red-7'], [data-theme='dark'] [class*='text-red-8'],
+[data-theme='dark'] [class*='text-red-9'] { color: var(--down) !important; }
+[data-theme='dark'] [class*='text-amber-7'], [data-theme='dark'] [class*='text-yellow-7'], [data-theme='dark'] [class*='text-yellow-8'],
+[data-theme='dark'] [class*='text-yellow-9'], [data-theme='dark'] [class*='text-yellow-6'] { color: var(--warn) !important; }
+[data-theme='dark'] [class*='text-blue-7'], [data-theme='dark'] [class*='text-blue-8'], [data-theme='dark'] [class*='text-blue-9'],
+[data-theme='dark'] [class*='text-blue-6'] { color: #7cb4ff !important; }
+[data-theme='dark'] [class*='border-yellow-'], [data-theme='dark'] [class*='border-blue-'], [data-theme='dark'] [class*='border-green-'],
+[data-theme='dark'] [class*='border-red-'], [data-theme='dark'] [class*='border-purple-'], [data-theme='dark'] [class*='border-amber-'] {
+  border-color: var(--line-2) !important;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   COMPONENT PRIMITIVES (same as OneSwap)
+   ══════════════════════════════════════════════════════════════════════════ */
+.tile {
+  background: var(--surface);
+  border: 1.5px solid var(--line);
+  box-shadow: 6px 6px 0 0 var(--shadow);
+}
+.tile-inset {
+  position: relative;
+  background: var(--inset);
+  border: 1.5px solid var(--line);
+  box-shadow: 3px 3px 0 0 var(--line);
+}
+/* Numbered folder tab on a tile's top edge: "01 / Source" */
+.tile-tab {
+  position: absolute;
+  top: -1.5px;
+  left: 14px;
+  transform: translateY(-100%);
+  background: var(--ink);
+  color: var(--on-ink);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  padding: 3px 8px 2px;
+}
+.tile-tab b { color: var(--accent); font-weight: 800; margin-right: 6px; }
+
+/* Primary action: lime slab that presses into its shadow */
+.btn-primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border: 1.5px solid #111;
+  box-shadow: 4px 4px 0 0 #111;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-weight: 800;
+  transition: transform 70ms ease, box-shadow 70ms ease, filter 120ms;
+}
+[data-theme='dark'] .btn-primary { box-shadow: 4px 4px 0 0 #1f2b00; border-color: #1f2b00; }
+.btn-primary:hover:not(:disabled) { filter: brightness(1.04) saturate(1.1); }
+.btn-primary:active:not(:disabled) { transform: translate(4px, 4px); box-shadow: 0 0 0 0 #111; }
+.btn-primary:disabled {
+  background: repeating-linear-gradient(-45deg, var(--hover) 0 8px, var(--surface) 8px 16px);
+  color: var(--muted);
+  border-color: var(--line);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+/* Outline button (nav, secondary) */
+.btn-outline {
+  border: 1.5px solid var(--line);
+  background: transparent;
+  color: var(--ink);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 700;
+  transition: background 120ms, color 120ms;
+}
+.btn-outline:hover { background: var(--ink); color: var(--on-ink); }
+
+.chip-on { background: var(--accent) !important; color: var(--accent-ink) !important; }
+
+.label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+/* Marker highlight for headline keywords */
+.mark {
+  background: linear-gradient(transparent 55%, var(--accent) 55%, var(--accent) 92%, transparent 92%);
+  padding: 0 0.15em;
+}
+
+@keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+.live-dot { width: 7px; height: 7px; border-radius: 9999px; background: var(--accent); animation: pulse-dot 1.6s ease-in-out infinite; }
+[data-theme='dark'] .live-dot { background: #c6f432; }
+
+/* ── Ticker ─────────────────────────────────────────────────────────────── */
+.ticker { background: var(--ticker-bg); color: var(--ticker-fg); }
+.ticker .up   { color: #3ddc84; }
+.ticker .down { color: #ff6b63; }
+
+/* ── Scan: centred form → split layout (View Transitions) ─────────────── */
+::view-transition-group(*) {
+  animation-duration: 420ms;
+  animation-timing-function: cubic-bezier(0.22, 0.8, 0.2, 1);
+}
+@keyframes vt-fade-out { to { opacity: 0; } }
+@keyframes vt-fade-in  { from { opacity: 0; } }
+::view-transition-old(scan-form) { animation: vt-fade-out 140ms ease-out both; }
+::view-transition-new(scan-form) { animation: vt-fade-in 240ms 60ms ease-out both; }
+@keyframes panel-in  { from { transform: translateX(60px); opacity: 0; } }
+::view-transition-new(scan-results):only-child { animation: panel-in 420ms cubic-bezier(0.22, 0.8, 0.2, 1) both; }
+@keyframes hero-out { to { transform: translateY(-14px); opacity: 0; } }
+@keyframes hero-in  { from { transform: translateY(-14px); opacity: 0; } }
+::view-transition-old(scan-hero):only-child { animation: hero-out 220ms ease-in both; }
+::view-transition-new(scan-hero):only-child { animation: hero-in 380ms ease-out both; }
+
+@keyframes slideUp { from { transform: translateY(16px); opacity: 0; } to { transform: none; opacity: 1; } }
+.animate-slideUp { animation: slideUp 180ms ease-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 1ms !important; transition-duration: 1ms !important; }
+}
+
+/* Scan: protocol card that found something */
+.scan-hit { background: color-mix(in srgb, var(--accent) 22%, var(--inset)); }
+[data-theme='dark'] .scan-hit { background: color-mix(in srgb, var(--accent) 40%, var(--inset)); }
+.btn-sm { box-shadow: 2px 2px 0 0 #111; }
+.btn-sm:active:not(:disabled) { transform: translate(2px, 2px); }

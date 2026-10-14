@@ -4,10 +4,10 @@ const Alert = ({ type = "info", message, onClose, duration = 10000 }) => {
   const [visible, setVisible] = useState(true);
 
   const baseStyle =
-    "fixed top-4 right-4 p-3 rounded-lg flex items-center gap-2 shadow-lg border z-50 transition-opacity duration-500";
+    "fixed top-20 right-4 z-50 max-w-md px-3 py-2.5 flex items-center gap-2 text-[13px] bg-[var(--inset)] text-[var(--ink)] border-[1.5px] border-[var(--line)] border-l-[6px] shadow-[4px_4px_0_0_var(--line)] transition-opacity duration-500";
   const styles = {
     success: {
-      bg: "bg-green-50 border-green-300 text-green-800",
+      bg: "!border-l-[var(--up)]",
       icon: (
         <svg
           xmlns="http://www.w3.org/2000/svg"
@@ -27,7 +27,7 @@ const Alert = ({ type = "info", message, onClose, duration = 10000 }) => {
       linkClass: "text-green-700 hover:text-green-900",
     },
     error: {
-      bg: "bg-red-50 border-red-300 text-red-800",
+      bg: "!border-l-[var(--down)]",
       icon: (
         <svg
           xmlns="http://www.w3.org/2000/svg"
@@ -47,7 +47,7 @@ const Alert = ({ type = "info", message, onClose, duration = 10000 }) => {
       linkClass: "text-red-700 hover:text-red-900",
     },
     warning: {
-      bg: "bg-yellow-50 border-yellow-300 text-yellow-800",
+      bg: "!border-l-[var(--warn)]",
       icon: (
         <svg
           xmlns="http://www.w3.org/2000/svg"
@@ -67,7 +67,7 @@ const Alert = ({ type = "info", message, onClose, duration = 10000 }) => {
       linkClass: "text-yellow-700 underline hover:text-yellow-900",
     },
     info: {
-      bg: "bg-blue-50 border-blue-300 text-blue-800",
+      bg: "!border-l-[var(--ink)]",
       icon: (
         <svg
           xmlns="http://www.w3.org/2000/svg"

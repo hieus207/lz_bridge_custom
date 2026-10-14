@@ -1,10 +1,11 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
+import { PublicKey } from "@solana/web3.js";
 import { ethers } from "ethers";
 import oftAbi from "../abis/OFT.json";
 import chainRpcsData from "../chainRpcs.json";
 import Alert from "./Alert";
 import SendParamsEditor from "./SendParamsEditor";
-import { LogOut } from "lucide-react";
+import { LogOut, ChevronDown } from "lucide-react";
 import OftScanner from "./OftScanner";
 import CustomChainForm from "./CustomChainForm";
 import useCustomChains from "../hooks/useCustomChains";
@@ -29,6 +30,7 @@ const CGC_PLATFORMS = {
   42161: "arbitrum-one",
   10: "optimistic-ethereum",
   8453: "base",
+  4663: "robinhood",
 };
 
 const CHAINS = {
@@ -40,6 +42,7 @@ const CHAINS = {
   Avalanche: 30106,
   Sonic: 30332,
   Base: 30184,
+  Robinhood: 30416,
   Solana: 30168,
   Custom: null,
 };
@@ -52,11 +55,23 @@ const SUPPORTED_CHAINS = {
   42161: { name: "Arbitrum", hex: "0xa4b1" },
   10: { name: "Optimism", hex: "0xa" },
   8453: { name: "Base", hex: "0x2105" },
+  4663: { name: "Robinhood", hex: "0x1237" },
 };
+
+// CoinGecko listing lookups, per session (never persisted — listings change).
+const CGC_CACHE = new Map();
+const CGC_TTL = 10 * 60 * 1000;
+// Drop the old forever-cached entries from localStorage.
+try {
+  Object.keys(localStorage)
+    .filter((k) => /^(listing|cgclink|tokenimg)_/.test(k))
+    .forEach((k) => localStorage.removeItem(k));
+} catch { /* storage unavailable */ }
 
 const CHAIN_ICON_COLORS = {
   1: "bg-blue-500", 56: "bg-yellow-500", 137: "bg-purple-500",
   43114: "bg-red-500", 42161: "bg-sky-500", 10: "bg-red-400", 8453: "bg-blue-600",
+  4663: "bg-lime-500",
 };
 
 // Per-chain RPC endpoints with fallbacks
@@ -66,7 +81,9 @@ const CHAIN_RPCS = chainRpcsData;
 const RPC_TAB_LABELS = ["Def", "Fb1", "Fb2", "Fb3", "Cus"];
 const CUSTOM_RPC_INDEX = 4;
 
-const BridgeButton = ({ signer, address, disconnect, wallet }) => {
+const SOLANA_EID = 30168;
+
+const BridgeButton = ({ signer, address, disconnect, wallet, onSelectSolana, onSummary }) => {
   const [oftAddress, setOftAddress] = useState("");
   const [amount, setAmount] = useState("0");
   const [info, setInfo] = useState(null);
@@ -74,6 +91,21 @@ const BridgeButton = ({ signer, address, disconnect, wallet }) => {
   const [dstChain, setDstChain] = useState("Ethereum");
   const [, setOftContract] = useState(null);
   const [dstEidValue, setDstEidValue] = useState(CHAINS[dstChain]);
+  // Latest destination for async checks: picking a chain mid-check must not be overwritten
+  const dstEidRef = useRef(dstEidValue);
+  dstEidRef.current = dstEidValue;
+  // Sending to Solana: the LZ `to` must be the recipient's Solana pubkey, not our EVM address
+  const [solRecipient, setSolRecipient] = useState(() => localStorage.getItem("lz_sol_recipient") || "");
+  const solTo = useMemo(() => {
+    try { return ethers.hexlify(new PublicKey(solRecipient.trim()).toBytes()); } catch { return null; }
+  }, [solRecipient]);
+  const toSolana = Number(sendParams?.dstEid ?? dstEidValue) === SOLANA_EID;
+  const hasSendParams = !!sendParams;
+  useEffect(() => {
+    if (!hasSendParams || !address) return;
+    const to = toSolana ? (solTo || ethers.ZeroHash) : ethers.zeroPadValue(address, 32);
+    setSendParams((prev) => (prev && prev.to !== to ? { ...prev, to } : prev));
+  }, [toSolana, solTo, hasSendParams, sendParams?.to, address]);
   const [useWalletRpc, setUseWalletRpc] = useState(() => localStorage.getItem("lz_use_wallet_rpc") === "true");
   const [provider, setProvider] = useState(null);
   const [currentChainId, setCurrentChainIdRaw] = useState(() => {
@@ -518,7 +550,7 @@ const tryWithFallback = async (chainId, fn) => {
       await refreshBalance(tokenAddress, decimals);
 
       const recipient = await signer.getAddress();
-      const dstEid = Number(dstEidValue);
+      const dstEid = Number(dstEidRef.current);
       const extraOptions = localStorage.getItem("lz_extraOptions") || "0x";
 
       const amountWei = ethers.parseUnits(amount, decimals);
@@ -595,6 +627,11 @@ const tryWithFallback = async (chainId, fn) => {
       }
       if (!provider) {
         setAlert({ type: "error", message: "Provider not found, Try reconnect or use custom RPC" });
+        return;
+      }
+
+      if (toSolana && !solTo) {
+        setAlert({ type: "error", message: "Enter a valid Solana recipient address" });
         return;
       }
 
@@ -756,46 +793,48 @@ const tryWithFallback = async (chainId, fn) => {
       setTokenImage(null);
       return;
     }
-    const cacheKey = `listing_${info.tokenAddress}_${currentChainId}`;
-    const linkKey = `cgclink_${info.tokenAddress}_${currentChainId}`;
-    const imgKey = `tokenimg_${info.tokenAddress}_${currentChainId}`;
-    const cached = localStorage.getItem(cacheKey);
-    if (cached) {
-      setListingStatus(cached);
-      setCgcLink(localStorage.getItem(linkKey) || null);
-      setTokenImage(localStorage.getItem(imgKey) || null);
+    // In-memory only: a persisted "Not listed" would never update once the token gets listed.
+    const key = `${currentChainId}:${info.tokenAddress.toLowerCase()}`;
+    const hit = CGC_CACHE.get(key);
+    if (hit && Date.now() - hit.at < CGC_TTL) {
+      setListingStatus(hit.status);
+      setCgcLink(hit.link);
+      setTokenImage(hit.img);
       return;
     }
-    setListingStatus("Checking...");
+    setCgcLink(null);
+    setTokenImage(null);
     const platform = CGC_PLATFORMS[currentChainId];
     if (!platform) {
       setListingStatus("Not listed");
-      localStorage.setItem(cacheKey, "Not listed");
       return;
     }
+    setListingStatus("Checking...");
+    let cancelled = false;
     fetch(`https://api.coingecko.com/api/v3/coins/${platform}/contract/${info.tokenAddress}`)
       .then(res => {
         if (res.status === 200) return res.json();
-        throw new Error("not found");
+        // 429 / 5xx are not an answer — don't cache them
+        throw Object.assign(new Error("not found"), { definitive: res.status === 404 });
       })
       .then(data => {
-        setListingStatus("CGC listed");
-        localStorage.setItem(cacheKey, "CGC listed");
-        // Lấy link CoinGecko
-        const cgcUrl = `https://www.coingecko.com/en/coins/${data?.id || ""}`;
-        setCgcLink(cgcUrl);
-        localStorage.setItem(linkKey, cgcUrl);
-        // Lấy ảnh coin
-        const img = data?.image?.small || data?.image?.thumb || null;
-        if (img) {
-          setTokenImage(img);
-          localStorage.setItem(imgKey, img);
-        }
+        const entry = {
+          at: Date.now(),
+          status: "CGC listed",
+          link: `https://www.coingecko.com/en/coins/${data?.id || ""}`,
+          img: data?.image?.small || data?.image?.thumb || null,
+        };
+        CGC_CACHE.set(key, entry);
+        if (cancelled) return;
+        setListingStatus(entry.status);
+        setCgcLink(entry.link);
+        setTokenImage(entry.img);
       })
-      .catch(() => {
-        setListingStatus("Not listed");
-        localStorage.setItem(cacheKey, "Not listed");
+      .catch((err) => {
+        if (err.definitive) CGC_CACHE.set(key, { at: Date.now(), status: "Not listed", link: null, img: null });
+        if (!cancelled) setListingStatus(err.definitive ? "Not listed" : null);
       });
+    return () => { cancelled = true; };
   }, [info?.tokenAddress, currentChainId]);
 
   useEffect(() => {
@@ -821,6 +860,10 @@ const tryWithFallback = async (chainId, fn) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [amount, info?.decimals]);
 
+  useEffect(() => {
+    onSummary?.({ symbol: info?.symbol || null, from: currentChainId ? chainName(currentChainId) : null, to: dstChain === "Custom" ? null : dstChain });
+  }, [info?.symbol, currentChainId, dstChain, onSummary]);
+
   // ============================
   // RENDER
   // ============================
@@ -828,10 +871,11 @@ const tryWithFallback = async (chainId, fn) => {
     <div className="flex flex-col lg:flex-row gap-6 w-full">
       {/* ====== LEFT PANEL — Setup ====== */}
       {!setupCollapsed && (
-      <div className="w-full lg:w-[340px] flex-shrink-0 self-start bg-white rounded-2xl shadow-sm border border-gray-100 p-5 flex flex-col gap-4">
+      <div className="relative w-full lg:w-[340px] flex-shrink-0 self-start bg-white rounded-2xl shadow-sm border border-gray-100 p-5 flex flex-col gap-4">
+        <span className="tile-tab"><b>01</b>Setup</span>
         {/* Header + wallet */}
         <div className="flex items-center justify-between">
-          <h2 className="text-lg font-bold text-gray-900">Setup Bridge</h2>
+          <span className="label">Source</span>
           <div className="flex items-center gap-2">
             <button
               onClick={() => setShowSettings(true)}
@@ -868,7 +912,7 @@ const tryWithFallback = async (chainId, fn) => {
 
         {/* Source chain — compact */}
         <div>
-          <div className="border border-gray-200 rounded-xl px-3 py-2.5 flex items-center justify-between">
+          <div className="tile-inset px-3 py-2.5 flex items-center justify-between hover:bg-gray-100 transition">
             <div className="flex items-center gap-2">
               <span className={`w-6 h-6 ${CHAIN_ICON_COLORS[currentChainId] || "bg-gray-400"} rounded-full flex items-center justify-center text-white text-xs font-bold`}>
                 {(currentChainId ? chainName(currentChainId) : "?").charAt(0)}
@@ -886,6 +930,10 @@ const tryWithFallback = async (chainId, fn) => {
                   setShowAddChain(true);
                   return;
                 }
+                if (val === "solana") {
+                  onSelectSolana?.();
+                  return;
+                }
                 const chainId = parseInt(val, 10);
                 if (!chainId) return;
                 setShowAddChain(false);
@@ -893,7 +941,8 @@ const tryWithFallback = async (chainId, fn) => {
                 // Ask the wallet to follow now; getTxSigner enforces it again at send time.
                 if (wallet.chainId !== chainId) switchChain("0x" + chainId.toString(16));
               }}
-              className="bg-transparent text-gray-400 outline-none cursor-pointer max-w-[7rem]"
+              aria-label="Source chain"
+              className="absolute inset-0 w-full opacity-0 cursor-pointer"
             >
               {!currentChainId && <option value="">Select…</option>}
               {Object.entries(SUPPORTED_CHAINS).map(([id, chain]) => (
@@ -907,8 +956,14 @@ const tryWithFallback = async (chainId, fn) => {
               {isCustomChain && !getCustomChain(currentChainId) && (
                 <option value={currentChainId}>Chain {currentChainId}</option>
               )}
+              {onSelectSolana && (
+                <optgroup label="Non-EVM">
+                  <option value="solana">Solana</option>
+                </optgroup>
+              )}
               <option value="__add">+ Add custom chain…</option>
             </select>
+            <ChevronDown className="w-4 h-4 text-gray-500 flex-shrink-0" />
           </div>
 
           {isCustomChain && getCustomChain(currentChainId) && (
@@ -965,7 +1020,7 @@ const tryWithFallback = async (chainId, fn) => {
             placeholder="Paste token contract address..."
             value={oftAddress}
             onChange={(e) => setOftAddress(e.target.value)}
-            className="w-full border border-gray-200 px-3 py-2 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-gray-300"
+            className="tile-inset w-full px-3 py-2 text-sm font-mono"
           />
         </div>
 
@@ -973,7 +1028,7 @@ const tryWithFallback = async (chainId, fn) => {
         <div className="flex gap-2">
           <button
             onClick={handleCheck}
-            className="flex-1 py-2.5 bg-gray-900 text-white font-semibold rounded-xl hover:bg-gray-800 transition text-sm"
+            className="btn-primary flex-1 py-2.5 text-sm"
           >
             Check
           </button>
@@ -1104,7 +1159,8 @@ const tryWithFallback = async (chainId, fn) => {
       )}
 
       {/* ====== MIDDLE PANEL — Bridge form ====== */}
-      <div className={`flex-1 min-w-0 max-w-xl bg-white rounded-2xl shadow-sm border border-gray-100 p-6 flex flex-col gap-5 ${setupCollapsed ? "max-w-2xl mx-auto" : ""}`}>
+      <div className={`relative flex-1 min-w-0 max-w-xl bg-white rounded-2xl shadow-sm border border-gray-100 p-6 flex flex-col gap-5 ${setupCollapsed ? "max-w-2xl mx-auto" : ""}`}>
+        <span className="tile-tab"><b>02</b>Bridge</span>
         {/* Collapsed setup bar */}
         {setupCollapsed && (
           <div className="flex items-center gap-3 bg-gray-50 border border-gray-200 rounded-xl px-4 py-2.5">
@@ -1162,19 +1218,13 @@ const tryWithFallback = async (chainId, fn) => {
           </div>
         ) : (
           <>
-            {/* Header */}
-            <div className="flex items-center justify-between">
-              <h2 className="text-xl font-bold text-gray-900">Bridge</h2>
-            </div>
-
             {/* Token info card */}
             {(() => {
               const srcName = currentChainId ? chainName(currentChainId) : "";
               const srcKey = Object.keys(CHAINS).find(k => k === srcName || (k === "BSC" && srcName === "BNB")) || "";
-              const infoBg = ({Ethereum:"bg-blue-100/80",BSC:"bg-yellow-100/80",Polygon:"bg-purple-100/80",Avalanche:"bg-red-100/80",Arbitrum:"bg-sky-100/80",Optimism:"bg-red-50",Base:"bg-blue-200/80",Sonic:"bg-indigo-100/80",Solana:"bg-gradient-to-r from-purple-100/80 to-green-100/80"})[srcKey] || "bg-gray-100/80";
-              const infoIcon = ({Ethereum:"bg-blue-500",BSC:"bg-yellow-500",Polygon:"bg-purple-500",Avalanche:"bg-red-500",Arbitrum:"bg-sky-500",Optimism:"bg-red-400",Base:"bg-blue-600",Sonic:"bg-indigo-500",Solana:"bg-purple-600"})[srcKey] || "bg-gray-400";
+              const infoIcon = ({Ethereum:"bg-blue-500",BSC:"bg-yellow-500",Polygon:"bg-purple-500",Avalanche:"bg-red-500",Arbitrum:"bg-sky-500",Optimism:"bg-red-400",Base:"bg-blue-600",Robinhood:"bg-lime-500",Sonic:"bg-indigo-500",Solana:"bg-purple-600"})[srcKey] || "bg-gray-400";
               return (
-            <div className={`rounded-2xl p-4 ${infoBg}`}>
+            <div className="tile-inset p-4">
               <div className="flex items-center justify-between mb-3">
                 <div className="flex items-center gap-3">
                   {tokenImage ? (
@@ -1190,21 +1240,21 @@ const tryWithFallback = async (chainId, fn) => {
                   </div>
                 </div>
                 {listingStatus === "CGC listed" && cgcLink ? (
-                  <a href={cgcLink} target="_blank" rel="noopener noreferrer" className="bg-green-600 text-white text-xs px-2.5 py-1 rounded-full flex items-center gap-1 font-medium hover:bg-green-700 transition">
+                  <a href={cgcLink} target="_blank" rel="noopener noreferrer" className="chip-on border-[1.5px] border-[var(--line)] text-[10px] uppercase tracking-wider px-2 py-0.5 flex items-center gap-1 font-extrabold">
                     &#10003; CGC listed
                   </a>
                 ) : (
                   <span className={`text-xs px-2.5 py-1 rounded-full flex items-center gap-1 font-medium ${
                     listingStatus === "Checking..." ? "bg-yellow-100 text-yellow-700" :
-                    "bg-white/60 text-gray-600"
+                    "border-[1.5px] border-[var(--line-2)] text-gray-500"
                   }`}>
                     {listingStatus || "\u2014"}
                   </span>
                 )}
               </div>
 
-              <div className="bg-white/50 rounded-xl p-3 mb-3">
-                <div className="text-xs text-gray-500 mb-0.5">Contract address</div>
+              <div className="bg-gray-50 p-3 mb-3">
+                <div className="label mb-0.5">Contract address</div>
                 <div className="font-mono text-xs text-gray-700 truncate">{info.tokenAddress}</div>
               </div>
 
@@ -1223,7 +1273,7 @@ const tryWithFallback = async (chainId, fn) => {
             {/* Amount to bridge */}
             <div>
               <div className="flex items-center justify-between mb-2">
-                <p className="text-sm text-gray-500">Amount to bridge</p>
+                <p className="label">Amount to bridge</p>
                 <p className="text-sm text-gray-500 flex items-center gap-1">Balance: {balanceLoading ? (
                   <svg className="animate-spin h-4 w-4 text-green-500 inline" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"/></svg>
                 ) : (
@@ -1235,7 +1285,7 @@ const tryWithFallback = async (chainId, fn) => {
                   </button>
                 )}</p>
               </div>
-              <div className="border border-gray-200 rounded-xl p-4">
+              <div className="tile-inset p-4">
                 <input
                   type="number"
                   value={amount}
@@ -1246,13 +1296,13 @@ const tryWithFallback = async (chainId, fn) => {
                 <div className="flex justify-center gap-4 mt-3">
                   <button
                     onClick={() => { const v = parseFloat(balance) * 0.5; setAmount(String(Math.floor(v * 1e5) / 1e5)); }}
-                    className="text-sm font-medium text-green-600 hover:text-green-700 transition"
+                    className="text-[11px] font-bold uppercase tracking-wider px-2 py-0.5 border-[1.5px] border-[var(--line)] hover:bg-gray-900 hover:text-white transition"
                   >
                     50%
                   </button>
                   <button
                     onClick={() => { const v = parseFloat(balance); setAmount(String(Math.floor(v * 1e5) / 1e5)); }}
-                    className="text-sm font-medium text-green-600 hover:text-green-700 transition"
+                    className="text-[11px] font-bold uppercase tracking-wider px-2 py-0.5 border-[1.5px] border-[var(--line)] hover:bg-gray-900 hover:text-white transition"
                   >
                     Max
                   </button>
@@ -1262,13 +1312,11 @@ const tryWithFallback = async (chainId, fn) => {
 
             {/* Destination */}
             <div>
-              <p className="text-sm text-gray-500 mb-2">Destination</p>
-              <div className={`rounded-xl px-4 py-3 text-center ${
-                ({Ethereum:"bg-blue-100/80",BSC:"bg-yellow-100/80",Polygon:"bg-purple-100/80",Avalanche:"bg-red-100/80",Arbitrum:"bg-sky-100/80",Optimism:"bg-red-50",Base:"bg-blue-200/80",Sonic:"bg-indigo-100/80",Solana:"bg-gradient-to-r from-purple-100/80 to-green-100/80"})[dstChain] || "bg-gray-100/80"
-              }`}>
+              <p className="label mb-2">Destination</p>
+              <div className="tile-inset px-4 py-3 text-center">
                 <div className="flex items-center justify-center gap-2 mb-1">
                   <span className={`w-5 h-5 rounded-full flex items-center justify-center text-white text-[10px] font-bold ${
-                    ({Ethereum:"bg-blue-500",BSC:"bg-yellow-500",Polygon:"bg-purple-500",Avalanche:"bg-red-500",Arbitrum:"bg-sky-500",Optimism:"bg-red-400",Base:"bg-blue-600",Sonic:"bg-indigo-500",Solana:"bg-purple-600"})[dstChain] || "bg-gray-400"
+                    ({Ethereum:"bg-blue-500",BSC:"bg-yellow-500",Polygon:"bg-purple-500",Avalanche:"bg-red-500",Arbitrum:"bg-sky-500",Optimism:"bg-red-400",Base:"bg-blue-600",Robinhood:"bg-lime-500",Sonic:"bg-indigo-500",Solana:"bg-purple-600"})[dstChain] || "bg-gray-400"
                   }`}>
                     {(dstChain || "?").charAt(0)}
                   </span>
@@ -1311,6 +1359,26 @@ const tryWithFallback = async (chainId, fn) => {
                 </div>
               </div>
             </div>
+
+            {toSolana && (
+              <div>
+                <label className="text-xs text-gray-400">Recipient Solana address</label>
+                <input
+                  type="text"
+                  placeholder="Solana wallet address (base58)…"
+                  value={solRecipient}
+                  onChange={(e) => {
+                    const v = e.target.value.trim();
+                    setSolRecipient(v);
+                    localStorage.setItem("lz_sol_recipient", v);
+                  }}
+                  className={`mt-1 w-full border px-3 py-2 rounded-xl text-sm font-mono focus:outline-none focus:ring-2 focus:ring-gray-300 ${solRecipient && !solTo ? "border-red-300" : "border-gray-200"}`}
+                />
+                {!solTo && (
+                  <p className="mt-1 text-[11px] text-amber-700">Required — tokens go to this Solana wallet (the OFT creates its token account).</p>
+                )}
+              </div>
+            )}
 
             {/* Advanced parameters (collapsible) */}
             <div className="border border-gray-200 rounded-xl">
@@ -1391,11 +1459,7 @@ const tryWithFallback = async (chainId, fn) => {
                   ? handleApprove(info.tokenAddress, oftAddress, amount, info.decimals || 18)
                   : handleBridge()
               }
-              className={`w-full py-4 font-bold rounded-2xl text-lg transition-colors ${
-                needsApproval
-                  ? "bg-yellow-500 text-white hover:bg-yellow-600"
-                  : "bg-gray-900 text-white hover:bg-gray-800"
-              }`}
+              className={`btn-primary w-full h-14 text-base ${needsApproval ? "is-approve" : ""}`}
             >
               {needsApproval ? "Approve" : "Bridge now"}
             </button>
@@ -1404,7 +1468,8 @@ const tryWithFallback = async (chainId, fn) => {
       </div>
 
       {/* ====== RIGHT PANEL — Transaction History ====== */}
-        <div className="w-full lg:w-[360px] flex-shrink-0 self-start bg-white rounded-2xl shadow-sm border border-gray-100 p-4">
+        <div className="relative w-full lg:w-[360px] flex-shrink-0 self-start bg-white rounded-2xl shadow-sm border border-gray-100 p-4">
+          <span className="tile-tab"><b>03</b>History</span>
           <button
             onClick={() => setShowTxHistory(!showTxHistory)}
             className="w-full flex items-center justify-between"
@@ -1413,8 +1478,8 @@ const tryWithFallback = async (chainId, fn) => {
               <svg className="w-5 h-5 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>
-              <h3 className="text-base font-bold text-gray-900">History</h3>
-              <span className="text-xs text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded-full">{txHistory.length}</span>
+              <h3 className="text-sm font-extrabold uppercase tracking-[0.1em] text-gray-900">History</h3>
+              <span className="text-[10px] font-bold bg-gray-900 text-white px-1.5 py-px rounded-full">{txHistory.length}</span>
             </div>
             <div className="flex items-center gap-2">
               {txHistory.length > 0 && (
@@ -1614,8 +1679,7 @@ const tryWithFallback = async (chainId, fn) => {
                 <p className="text-center text-gray-400 py-8">No saved routes</p>
               ) : (
                 [...savedRoutes].reverse().map((route, idx) => {
-                  const imgKey = `tokenimg_${route.tokenAddress}_${route.chainId}`;
-                  const img = localStorage.getItem(imgKey);
+                  const img = route.tokenAddress ? CGC_CACHE.get(`${route.chainId}:${route.tokenAddress.toLowerCase()}`)?.img : null;
                   const srcName = SUPPORTED_CHAINS[route.chainId]?.name || `Chain ${route.chainId}`;
                   const dstName = route.dstChain || "?";
                   return (

@@ -39,5 +39,9 @@
     "https://mainnet.base.org",
     "https://base.drpc.org",
     "https://1rpc.io/base"
+  ],
+  "4663": [
+    "https://rpc.mainnet.chain.robinhood.com",
+    "https://robinhood.drpc.org"
   ]
 }

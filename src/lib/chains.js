@@ -56,6 +56,15 @@ export const CHAINS = {
     wormhole: { chainId: 30, tokenBridge: "0x8d2de8d2f73F1F4cAB472AC9A881C9b123C79627" },
     holderApis: {},
   },
+  // Arbitrum Orbit L2. No Wormhole Token Bridge; Blockscout API sits behind Cloudflare,
+  // so holders come from the on-chain log fallback.
+  4663: {
+    id: 4663, blockTime: 0.1, name: "Robinhood", explorer: "https://robinhoodchain.blockscout.com",
+    nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+    lzKey: "robinhood", hyperlane: "robinhood", oklink: null, cgPlatform: "robinhood",
+    wormhole: null,
+    holderApis: {},
+  },
 };
 
 export const CHAIN_LIST = Object.values(CHAINS);
@@ -68,9 +77,26 @@ export const getRpcs = (chainId) => {
   return custom ? [custom.rpc] : [];
 };
 
-export const chainName = (chainId) => CHAINS[chainId]?.name || getCustomChain(chainId)?.name || `Chain ${chainId}`;
+// Display names for chain ids that registries (e.g. CCIP destinations) mention but we don't support.
+const OTHER_CHAIN_NAMES = {
+  25: "Cronos", 100: "Gnosis", 130: "Unichain", 143: "Monad", 146: "Sonic", 196: "X Layer", 252: "Fraxtal",
+  324: "zkSync", 480: "World Chain", 1088: "Metis", 1135: "Lisk", 1329: "Sei", 2741: "Abstract", 5000: "Mantle",
+  8217: "Kaia", 16661: "0G", 34443: "Mode", 42220: "Celo", 57073: "Ink", 59144: "Linea", 80094: "Berachain",
+  81457: "Blast", 167000: "Taiko", 534352: "Scroll", 999: "HyperEVM", 9745: "Plasma",
+  "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d": "Solana", "aptos-1": "Aptos",
+};
+export const anyChainName = (id) => CHAINS[id]?.name || OTHER_CHAIN_NAMES[id] || String(id);
+
+// Non-EVM source understood by the scanner / bridge UI (not a numeric chain id)
+export const SOLANA = "solana";
+export const isBase58Address = (v) => typeof v === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v);
+
+export const chainName = (chainId) =>
+  chainId === SOLANA ? "Solana" : CHAINS[chainId]?.name || getCustomChain(chainId)?.name || `Chain ${chainId}`;
 
 export const explorerAddressUrl = (chainId, address) => {
+  if (isBase58Address(address)) return `https://solscan.io/account/${address}`;
+  if (chainId === SOLANA) return null; // an EVM address shown on a Solana scan: chain unknown
   const explorer = CHAINS[chainId]?.explorer || getCustomChain(chainId)?.explorer;
   return explorer ? `${explorer.replace(/\/$/, "")}/address/${address}` : null;
 };
@@ -78,7 +104,7 @@ export const explorerAddressUrl = (chainId, address) => {
 const LZ_KEY_TO_ID = Object.fromEntries(CHAIN_LIST.map((c) => [c.lzKey, c.id]));
 export const chainIdFromLzKey = (key) => LZ_KEY_TO_ID[key] ?? null;
 
-const WH_ID_TO_ID = Object.fromEntries(CHAIN_LIST.map((c) => [c.wormhole.chainId, c.id]));
+const WH_ID_TO_ID = Object.fromEntries(CHAIN_LIST.filter((c) => c.wormhole).map((c) => [c.wormhole.chainId, c.id]));
 export const chainIdFromWormholeId = (whId) => WH_ID_TO_ID[whId] ?? null;
 
 // Params for wallet_addEthereumChain (used when the wallet doesn't know the chain yet).

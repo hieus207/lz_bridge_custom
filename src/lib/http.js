@@ -1,5 +1,5 @@
 // Fetch helpers: hard timeouts (a dead API must never hang the scan) and
-// in-memory caching with request de-duplication for large registry files.
+// request de-duplication for the bridge registries.
 
 const hostOf = (url) => {
   try { return new URL(url, window.location.href).host; } catch { return url; }
@@ -24,18 +24,13 @@ export async function fetchJson(url, opts) {
   return resp.json();
 }
 
-const cache = new Map(); // key -> { at, promise }
-const DEFAULT_TTL = 30 * 60 * 1000;
+const inflight = new Map(); // key -> promise
 
-// Runs `loader` once per key per TTL; concurrent callers share the same promise.
-// Failures are not cached so the next scan retries.
-export function cached(key, loader, ttl = DEFAULT_TTL) {
-  const hit = cache.get(key);
-  if (hit && Date.now() - hit.at < ttl) return hit.promise;
-  const promise = loader().catch((err) => {
-    cache.delete(key);
-    throw err;
-  });
-  cache.set(key, { at: Date.now(), promise });
+// Concurrent callers within one scan share a request; nothing is kept afterwards,
+// so every scan reads the bridges' APIs fresh (a pair added minutes ago shows up).
+export function cached(key, loader) {
+  if (inflight.has(key)) return inflight.get(key);
+  const promise = loader().finally(() => inflight.delete(key));
+  inflight.set(key, promise);
   return promise;
 }

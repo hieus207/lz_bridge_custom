@@ -78,8 +78,11 @@ async function fromLogs(providers, token, onProgress, { maxBlocks = 300000, maxL
   let seen = 0;
   let to = null;
 
+  // Fast chains (0.1–0.25s blocks) need wide windows to cover any real history in budget.
+  const maxSpan = Math.max(100000, Math.floor(maxBlocks / 10));
   for (const provider of providers) {
     let span = 5000;
+    let ceiling = maxSpan; // lowered to the last span this RPC rejected
     try {
       if (to == null) to = await provider.getBlockNumber();
     } catch (err) {
@@ -101,11 +104,12 @@ async function fromLogs(providers, token, onProgress, { maxBlocks = 300000, maxL
         seen += logs.length;
         scanned += to - from + 1;
         to = from - 1;
-        if (logs.length < 1000 && span < 100000) span *= 2;
+        if (logs.length < 1000) span = Math.min(span * 2, ceiling);
         onProgress?.(`Log scan: ${scanned.toLocaleString()} blocks, ${seen} events…`);
       } catch (err) {
         lastErr = err;
         if (span <= 100) break; // this RPC refuses even tiny ranges → next RPC
+        ceiling = Math.max(100, span - 1);
         span = Math.max(100, Math.floor(span / 5));
       }
     }

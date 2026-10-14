@@ -6,13 +6,14 @@
 // breaking it, and the UI shows which source produced each finding.
 import { ethers } from "ethers";
 import {
-  CHAINS, CHAIN_LIST, getRpcs, chainName, chainIdFromLzKey, chainIdFromWormholeId,
+  CHAINS, CHAIN_LIST, getRpcs, chainName, chainIdFromLzKey, chainIdFromWormholeId, anyChainName,
 } from "./chains";
 import { cached, fetchJson, fetchWithTimeout } from "./http";
 import { makeProvider, multicall, probeContracts, classify, ERC20 } from "./onchain";
 import { discoverHolders } from "./holders";
+import { nativeBridgeChecks } from "./nativeBridges";
 
-export const PROTOCOL_KEYS = ["LayerZero", "Chainlink CCIP", "Wormhole", "Hyperlane"];
+export const PROTOCOL_KEYS = ["LayerZero", "Chainlink CCIP", "Wormhole", "Hyperlane", "Native bridge"];
 
 const lc = (s) => (typeof s === "string" ? s.toLowerCase() : "");
 const CG_TO_NAME = Object.fromEntries(CHAIN_LIST.map((c) => [c.cgPlatform, c.name]));
@@ -23,7 +24,7 @@ const withTimeout = (p, ms, label) =>
 
 // ─── Registries ──────────────────────────────────────────────────────────────
 
-const loadLzMetadata = () => cached("lz-meta", async () => {
+export const loadLzMetadata = () => cached("lz-meta", async () => {
   const json = await fetchJson("https://metadata.layerzero-api.com/v1/metadata/experiment/ofts/list", { timeout: 20000 });
   const index = new Map();
   const add = (a, entry) => {
@@ -44,21 +45,23 @@ const loadLzMetadata = () => cached("lz-meta", async () => {
   return index;
 });
 
-const loadLzTransfer = () => cached("lz-transfer", async () => {
+export const loadLzTransfer = () => cached("lz-transfer", async () => {
   const json = await fetchJson("https://transfer.layerzero-api.com/v1/tokens", { timeout: 20000 });
   return json.tokens || [];
 });
 
-const loadCcip = () => cached("ccip", async () => {
-  const json = await fetchJson("https://docs.chain.link/api/ccip/v1/tokens?environment=mainnet", { timeout: 20000 });
+// chain_id narrows the directory server-side to tokens live on that chain (~10× smaller).
+export const loadCcip = (chainId) => cached(`ccip:${chainId ?? "all"}`, async () => {
+  const q = chainId ? `&chain_id=${chainId}` : "";
+  const json = await fetchJson(`https://docs.chain.link/api/ccip/v1/tokens?environment=mainnet${q}`, { timeout: 20000 });
   return json.data || {};
 });
 
-const loadWormholeScan = () => cached("wh-secured", () =>
+export const loadWormholeScan = () => cached("wh-secured", () =>
   fetchJson("https://api.wormholescan.io/api/v1/wormhole/assets/secured-tokens", { timeout: 20000 })
 );
 
-const loadHyperlane = () => cached("hyperlane", async () => {
+export const loadHyperlane = () => cached("hyperlane", async () => {
   const resp = await fetchWithTimeout(
     "https://raw.githubusercontent.com/hyperlane-xyz/hyperlane-registry/main/deployments/warp_routes/warpRouteConfigs.yaml",
     { timeout: 20000 }
@@ -144,7 +147,7 @@ async function lzRegistry(token, chain) {
 }
 
 async function ccipRegistry(token, chainId) {
-  const data = await loadCcip();
+  const data = await loadCcip(chainId);
   const findings = [];
   for (const [symbol, perChain] of Object.entries(data)) {
     for (const [cid, e] of Object.entries(perChain)) {
@@ -160,7 +163,7 @@ async function ccipRegistry(token, chainId) {
         confidence: "high",
         source: "Chainlink CCIP directory",
         details: [["Symbol", symbol], ...(e.chainName ? [["Chain", e.chainName]] : [])],
-        destinations: (e.destinations || []).map((d) => (CHAINS[d] ? CHAINS[d].name : d)),
+        destinations: (e.destinations || []).map(anyChainName),
       });
     }
   }
@@ -197,6 +200,26 @@ const WRAPPED_IFACE = new ethers.Interface([
   "function nativeContract() view returns (bytes32)",
 ]);
 
+// Where a token from Wormhole chain `originWh` (32-byte address) has a Portal-wrapped
+// version, asked directly to each EVM Token Bridge.
+export async function wormholeAttestations(originWh, token32, excludeChainId) {
+  const others = CHAIN_LIST.filter((c) => c.id !== excludeChainId && c.wormhole);
+  const checks = await Promise.all(others.map(async (c) => {
+    for (const rpc of getRpcs(c.id).slice(0, 2)) {
+      try {
+        const p = makeProvider(rpc, c.id);
+        const [wrapped] = await withTimeout(
+          multicall(p, [{ target: c.wormhole.tokenBridge, iface: TB_IFACE, fn: "wrappedAsset", args: [originWh, token32] }]),
+          8000, c.name
+        );
+        return wrapped && wrapped !== ethers.ZeroAddress ? { chain: c, wrapped } : null;
+      } catch { /* next rpc */ }
+    }
+    return null;
+  }));
+  return checks.filter(Boolean);
+}
+
 // Authoritative Portal check straight from the Token Bridge contracts.
 async function wormholeOnchain(token, chain, provider) {
   const findings = [];
@@ -224,22 +247,7 @@ async function wormholeOnchain(token, chain, provider) {
   }
 
   // Native token: has it been attested (wrapped) on other chains?
-  const padded = ethers.zeroPadValue(token, 32);
-  const others = CHAIN_LIST.filter((c) => c.id !== chain.id);
-  const checks = await Promise.all(others.map(async (c) => {
-    for (const rpc of getRpcs(c.id).slice(0, 2)) {
-      try {
-        const p = makeProvider(rpc, c.id);
-        const [wrapped] = await withTimeout(
-          multicall(p, [{ target: c.wormhole.tokenBridge, iface: TB_IFACE, fn: "wrappedAsset", args: [chain.wormhole.chainId, padded] }]),
-          8000, c.name
-        );
-        return wrapped && wrapped !== ethers.ZeroAddress ? { chain: c, wrapped } : null;
-      } catch { /* next rpc */ }
-    }
-    return null;
-  }));
-  const attested = checks.filter(Boolean);
+  const attested = await wormholeAttestations(chain.wormhole.chainId, ethers.zeroPadValue(token, 32), chain.id);
   if (attested.length) {
     findings.push({
       protocol: "Wormhole",
@@ -276,7 +284,7 @@ async function hyperlaneRegistry(token, chain) {
         ...(!chain ? [["Chain", t.chainName]] : []),
       ],
       destinations: t.connections.map((c) => c.split("|")[1] || c),
-      bridgeLink: srcId ? `/nexus?nexusadr=${t.addressOrDenom}&chainId=${srcId}` : null,
+      bridgeLink: srcId ? `/bridge?proto=hyperlane&nexusadr=${t.addressOrDenom}&chainId=${srcId}` : null,
     });
   }
   return { findings };
@@ -330,7 +338,7 @@ export async function pickWorkingRpc(chainId, preferred) {
 
 const CONF_RANK = { low: 0, medium: 1, high: 2 };
 
-function mergeFinding(list, f) {
+export function mergeFinding(list, f) {
   const key = lc(f.address) || f.title;
   const existing = list.find((x) => (lc(x.address) || x.title) === key);
   if (!existing) {
@@ -355,9 +363,8 @@ export function emptyScanState() {
   return { protocols, meta: { progress: "Starting…", token: null } };
 }
 
-export async function scanToken({ token, chainId, rpcUrl, proxyBase, onState }) {
-  token = ethers.getAddress(token);
-  const chain = CHAINS[chainId] || null;
+// Shared progress plumbing for the EVM and Solana scanners.
+export function createScan(onState) {
   const state = emptyScanState();
 
   // Hand React a fresh snapshot each time (state is mutated in place below).
@@ -387,6 +394,13 @@ export async function scanToken({ token, chainId, rpcUrl, proxyBase, onState }) 
     }
   };
 
+  return { state, emit, setMeta, run };
+}
+
+export async function scanToken({ token, chainId, rpcUrl, proxyBase, onState }) {
+  token = ethers.getAddress(token);
+  const chain = CHAINS[chainId] || null;
+  const { state, emit, setMeta, run } = createScan(onState);
   emit();
 
   const tasks = [
@@ -409,7 +423,8 @@ export async function scanToken({ token, chainId, rpcUrl, proxyBase, onState }) 
     multicall(provider, ["symbol", "name", "decimals"].map((fn) => ({ target: token, iface: ERC20, fn })))
       .then(([symbol, name, decimals]) => setMeta({ token: { symbol, name, decimals: decimals != null ? Number(decimals) : null } }))
       .catch(() => {});
-    if (chain) tasks.push(run(["Wormhole"], () => wormholeOnchain(token, chain, provider)));
+    if (chain?.wormhole) tasks.push(run(["Wormhole"], () => wormholeOnchain(token, chain, provider)));
+    tasks.push(run(["Native bridge"], () => nativeBridgeChecks(token, chainId, provider)));
     tasks.push(run(PROTOCOL_KEYS, () => onchainAnalysis({ token, chainId, chain, provider, rpcUrl, proxyBase, setMeta })));
   } else {
     const msg = "No RPC reachable — on-chain checks skipped";
