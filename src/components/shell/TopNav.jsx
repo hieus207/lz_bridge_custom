@@ -5,6 +5,7 @@ import ThemeToggle from "./ThemeToggle";
 const NAV = [
   { to: "/scan", label: "Scan" },
   { to: "/bridge", label: "Bridge" },
+  { to: "/oppos", label: "Oppos" },
 ];
 
 // Brand mark: a lime bridge arch over the deck (same as public/icon.svg)
