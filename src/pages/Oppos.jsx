@@ -105,7 +105,7 @@ function ListItem({ r, selected, onClick, meta }) {
           {r.priority === "HIGH" && <Badge tone="warn">High</Badge>}
         </div>
         <div className="text-[11px] text-gray-500 truncate mt-0.5">
-          {meta || <>{a.verb} <b className="text-gray-700">{a.venue}</b> → {b.verb} <b className="text-gray-700">{b.venue}</b></>}
+          {meta || <>{a.verb} <b className="text-gray-700">{a.venue}</b> → {r.bridge_leg ? "🌉 → " : ""}{b.verb} <b className="text-gray-700">{b.venue}</b></>}
         </div>
       </div>
       <div className="text-right shrink-0">
@@ -135,6 +135,35 @@ function SideBox({ s }) {
     </a>
   );
 }
+
+// Middle box between buy and sell when the coins have to change chain
+function BridgeBox({ leg, verified, blocked }) {
+  const known = verified || !!leg.url;
+  const tone = verified ? "border-[var(--up)]" : blocked ? "border-[var(--down)] border-dashed" : known ? "border-[var(--line)]" : "border-[var(--line-2)] border-dashed";
+  const status = verified
+    ? [leg.protocol, leg.detail].filter(Boolean).join(" · ")
+    : blocked ? "không có cầu" : leg.url ? (leg.protocol || "link cầu") : "chưa xác định";
+  const body = (
+    <>
+      <div className="flex items-center justify-between gap-1">
+        <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400">🌉 Cầu</span>
+        {leg.url && <ExternalLink className="w-3.5 h-3.5 text-gray-300 group-hover:text-gray-700" />}
+      </div>
+      <div className="font-extrabold text-gray-900 whitespace-nowrap">{leg.from} → {leg.to}</div>
+      <div className={`text-[12px] mt-1 ${verified ? "text-[var(--up)] font-bold" : blocked ? "text-[var(--down)]" : "text-gray-500"}`}>{status}</div>
+    </>
+  );
+  const cls = `bg-[var(--surface)] border-[1.5px] ${tone} px-3 py-3 sm:w-40 shrink-0 flex flex-col justify-center group`;
+  return leg.url ? (
+    <a href={leg.url} target="_blank" rel="noopener noreferrer" className={`${cls} hover:bg-[var(--hover)] transition`}>{body}</a>
+  ) : (
+    <div className={cls}>{body}</div>
+  );
+}
+
+const Arrow = () => (
+  <div className="flex items-center justify-center"><ArrowRight className="w-5 h-5 text-gray-400 rotate-90 sm:rotate-0" /></div>
+);
 
 function StepList({ steps }) {
   return (
@@ -200,9 +229,15 @@ function Detail({ r, when, title, onBack }) {
         </div>
       </div>
 
-      <div className="flex items-stretch gap-2">
+      <div className="flex flex-col sm:flex-row items-stretch gap-2">
         <SideBox s={a} />
-        <div className="flex items-center"><ArrowRight className="w-5 h-5 text-gray-400" /></div>
+        <Arrow />
+        {r.bridge_leg && (
+          <>
+            <BridgeBox leg={r.bridge_leg} verified={r.verified} blocked={r.blocked} />
+            <Arrow />
+          </>
+        )}
         <SideBox s={b} />
       </div>
 
