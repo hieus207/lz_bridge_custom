@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowRight, Check, ChevronDown, Copy, ExternalLink, RefreshCw } from "lucide-react";
+import { ArrowLeft, ArrowRight, Check, ChevronRight, Copy, ExternalLink, RefreshCw } from "lucide-react";
 
-// Live OPPOS board from the dexcheck bot (via /api/oppos): one card per opportunity, plus the
-// bot's recent alerts. The viewing key comes from the bot's /webkey link (#key=…), is kept in
-// this browser only and sent with every request.
+// Live OPPOS board from the dexcheck bot (via /api/oppos): a compact list of opportunities (or the
+// bot's recent alerts) on the left, the selected one's trade and route on the right. The viewing
+// key comes from the bot's /webkey link (#key=…), is kept in this browser only, sent with every request.
 const KEY_STORE = "oppos_key";
 const POLL_MS = 10000;
-const MARKETS = [["ALL", "Tất cả"], ["FT", "Futures"], ["SP", "Spot"], ["CROSS", "Cross-chain"]];
+const MARKETS = [["ALL", "Tất cả"], ["FT", "Futures"], ["SP", "Spot"], ["CROSS", "Cross"]];
+const MARKET_LABEL = { FT: "Futures", SP: "Spot", CROSS: "Cross-chain" };
 
 const readKey = () => { try { return localStorage.getItem(KEY_STORE) || ""; } catch { return ""; } };
 const saveKey = (k) => { try { k ? localStorage.setItem(KEY_STORE, k) : localStorage.removeItem(KEY_STORE); } catch { /* ignore */ } };
@@ -19,6 +20,7 @@ const fmtP = (p) => {
   return `$${p.toExponential(3)}`;
 };
 const fmtLiq = (v) => (v >= 1e6 ? `$${(v / 1e6).toFixed(1)}M` : v >= 1e3 ? `$${(v / 1e3).toFixed(0)}K` : `$${(v || 0).toFixed(0)}`);
+const fmtDiff = (d, active = true) => `${d >= 0 && active ? "+" : ""}${d.toFixed(1)}%`;
 const ago = (ts) => {
   const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
   if (s < 60) return `${s}s`;
@@ -26,101 +28,34 @@ const ago = (ts) => {
   if (s < 86400) return `${Math.floor(s / 3600)}h`;
   return `${Math.floor(s / 86400)}d`;
 };
-const MARKET_LABEL = { FT: "Futures", SP: "Spot", CROSS: "Cross" };
+// "KuCoinFT" → "KuCoin", "HyperliquidFT" → "Hyperliquid"
+const exName = (cex) => (cex || "").replace(/(FT|SP)$/, "").replace(/^Okx$/, "OKX");
+const rowKey = (r) => `${r.market}|${r.symbol}|${r.cex || r.buy_chain}|${r.contract || r.buy_contract}`;
 
 // Which side is bought and which sold, in the trader's words
 function sides(r) {
   if (r.market === "CROSS") {
     return [
-      { verb: "Mua", venue: r.buy_chain_short, kind: "DEX", price: r.buy_price, href: r.buy_link, liq: r.buy_liq },
-      { verb: "Bán", venue: r.sell_chain_short, kind: "DEX", price: r.sell_price, href: r.sell_link, liq: r.sell_liq },
+      { verb: "Mua", venue: r.buy_chain_short, kind: "DEX", price: r.buy_price, href: r.buy_link, liq: r.buy_liq, contract: r.buy_contract },
+      { verb: "Bán", venue: r.sell_chain_short, kind: "DEX", price: r.sell_price, href: r.sell_link, liq: r.sell_liq, contract: r.sell_contract },
     ];
   }
-  const dex = { venue: r.chain_short, kind: "DEX", price: r.dex_price, href: r.dex_link };
-  const cex = { venue: r.cex_short, kind: r.market === "FT" ? "Futures" : "Spot", price: r.cex_price, href: r.cex_link };
+  const dex = { venue: r.chain_short, kind: "DEX", price: r.dex_price, href: r.dex_link, liq: r.liquidity, contract: r.contract };
+  const cex = { venue: exName(r.cex), kind: r.market === "FT" ? "Futures" : "Spot", price: r.cex_price, href: r.cex_link };
   if (r.market === "FT") {
-    return r.cex_above
-      ? [{ ...dex, verb: "Mua" }, { ...cex, verb: "Short" }]
-      : [{ ...cex, verb: "Long" }, { ...dex, verb: "Bán" }];
+    return r.cex_above ? [{ ...dex, verb: "Mua" }, { ...cex, verb: "Short" }] : [{ ...cex, verb: "Long" }, { ...dex, verb: "Bán" }];
   }
   return r.cex_above ? [{ ...dex, verb: "Mua" }, { ...cex, verb: "Bán" }] : [{ ...cex, verb: "Mua" }, { ...dex, verb: "Bán" }];
 }
 
-function CopyBtn({ text, label }) {
-  const [done, setDone] = useState(false);
-  if (!text) return null;
-  return (
-    <button
-      type="button"
-      onClick={() => navigator.clipboard?.writeText(text).then(() => { setDone(true); setTimeout(() => setDone(false), 1200); })}
-      className="inline-flex items-center gap-1 text-[11px] text-gray-500 hover:text-gray-900"
-      title={text}
-    >
-      {done ? <Check className="w-3.5 h-3.5 text-[var(--up)]" /> : <Copy className="w-3.5 h-3.5" />} {label}
-    </button>
-  );
+// Steps shown for a row: the verified route, or the hedge for reversed futures
+function stepsOf(r) {
+  if (r.verified) return r.steps;
+  if (r.market === "FT" && r.reverse) return [`Long ${exName(r.cex)} futures`, `bán ${r.chain_short} (coin đang giữ)`, "chốt khi về cân"];
+  return null;
 }
 
-function SideBox({ s }) {
-  return (
-    <a
-      href={s.href}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="tile-inset flex-1 min-w-0 px-3 py-2.5 hover:bg-[var(--hover)] transition group"
-    >
-      <div className="flex items-center justify-between gap-1">
-        <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400">{s.verb}</span>
-        <ExternalLink className="w-3 h-3 text-gray-300 group-hover:text-gray-600" />
-      </div>
-      <div className="font-extrabold text-gray-900 truncate">
-        {s.venue} <span className="text-[10px] font-bold text-gray-400 uppercase">{s.kind}</span>
-      </div>
-      <div className="text-[15px] tabular text-gray-900">{fmtP(s.price)}</div>
-      {s.liq != null && <div className="text-[10px] text-gray-400">liq {fmtLiq(s.liq)}</div>}
-    </a>
-  );
-}
-
-// Numbered steps: "Mua BSC" → "cầu → ETH (LayerZero)" → "nạp Bybit (ETH)"; ⚠️ steps in amber
-function Steps({ steps }) {
-  return (
-    <ol className="flex flex-wrap items-center gap-1.5">
-      {steps.map((st, i) => {
-        const warn = st.startsWith("⚠️");
-        return (
-          <li key={i} className="flex items-center gap-1.5">
-            {i > 0 && !warn && <ArrowRight className="w-3 h-3 text-gray-300 shrink-0" />}
-            <span className={`inline-flex items-center gap-1.5 px-2 py-1 text-[12px] border-[1.5px] ${
-              warn ? "border-[var(--warn)] text-[var(--warn)]" : "border-[var(--line-2)] text-gray-700"}`}>
-              {!warn && <b className="text-[10px] w-4 h-4 inline-flex items-center justify-center bg-[var(--ink)] text-[var(--on-ink)]">{i + 1}</b>}
-              {st.replace(/^⚠️\s*/, "⚠ ")}
-            </span>
-          </li>
-        );
-      })}
-    </ol>
-  );
-}
-
-function RouteBlock({ r }) {
-  const [open, setOpen] = useState(false);
-  if (r.verified) return <Steps steps={r.steps} />;
-  if (r.market === "FT" && r.reverse) {
-    // Futures below DEX: no transfer can close it — a hedge that waits for parity (⚖️ CÂN)
-    return <Steps steps={[`Long ${r.cex_short}`, `bán ${r.chain_short} (coin đang giữ)`, "chốt khi về cân"]} />;
-  }
-  const label = r.blocked ? "Không có đường đi" : "Chưa xác thực đường đi";
-  return (
-    <div className="text-[12px]">
-      <button type="button" onClick={() => setOpen((v) => !v)} className={`inline-flex items-center gap-1 ${r.blocked ? "text-[var(--down)]" : "text-gray-500"}`}>
-        {r.blocked ? "⛔" : "❔"} {label}
-        {r.reason && <ChevronDown className={`w-3 h-3 transition-transform ${open ? "rotate-180" : ""}`} />}
-      </button>
-      {open && r.reason && <p className="mt-1 text-gray-500">{r.reason}</p>}
-    </div>
-  );
-}
+const diffTone = (r) => (!r.active ? "text-gray-400" : r.reverse ? "text-[var(--down)]" : "text-[var(--up)]");
 
 function Badge({ children, tone = "line" }) {
   const cls = {
@@ -130,23 +65,127 @@ function Badge({ children, tone = "line" }) {
     down: "border-[var(--down)] text-[var(--down)]",
     warn: "border-[var(--warn)] text-[var(--warn)]",
   }[tone];
-  return <span className={`px-1.5 py-px text-[10px] font-bold uppercase tracking-wider border-[1.5px] ${cls}`}>{children}</span>;
+  return <span className={`px-1.5 py-px text-[10px] font-bold uppercase tracking-wider border-[1.5px] whitespace-nowrap ${cls}`}>{children}</span>;
 }
 
-function OppCard({ r }) {
-  const [a, b] = sides(r);
-  const contract = r.market === "CROSS" ? r.buy_contract : r.contract;
-  const diffTone = !r.active ? "text-gray-400" : r.reverse ? "text-[var(--down)]" : "text-[var(--up)]";
+function CopyBtn({ text, label }) {
+  const [done, setDone] = useState(false);
+  if (!text) return null;
   return (
-    <article className={`tile p-4 flex flex-col gap-3 min-w-0 ${r.active ? "" : "opacity-60"} ${r.verified && r.active ? "scan-hit" : ""}`}>
-      <header className="flex items-start justify-between gap-2">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="text-lg font-extrabold tracking-wide text-gray-900">{r.symbol}</span>
+    <button
+      type="button"
+      onClick={() => navigator.clipboard?.writeText(text).then(() => { setDone(true); setTimeout(() => setDone(false), 1200); })}
+      className="btn-outline px-2.5 py-1 text-[11px] inline-flex items-center gap-1"
+      title={text}
+    >
+      {done ? <Check className="w-3.5 h-3.5 text-[var(--up)]" /> : <Copy className="w-3.5 h-3.5" />} {label}
+    </button>
+  );
+}
+
+// ── list (left) ────────────────────────────────────────────────────────────
+
+function ListItem({ r, selected, onClick, meta }) {
+  const [a, b] = sides(r);
+  const ok = r.verified && r.active;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`w-full text-left px-3 py-2.5 border-[1.5px] flex items-center gap-3 transition ${
+        selected ? "border-[var(--line)] bg-[var(--surface)] shadow-[3px_3px_0_var(--line)]" : "border-[var(--line-2)] bg-[var(--surface)] hover:border-[var(--line)]"
+      } ${r.active ? "" : "opacity-55"}`}
+    >
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1.5">
+          <span className="font-extrabold text-gray-900 truncate">{r.symbol}</span>
+          {r.star && <span className="text-[11px]">⭐</span>}
+          <Badge tone="ink">{r.market === "CROSS" ? "Cross" : r.market}</Badge>
+          {r.reverse && r.active && <Badge tone="down">Ngược</Badge>}
+          {r.priority === "HIGH" && <Badge tone="warn">High</Badge>}
+        </div>
+        <div className="text-[11px] text-gray-500 truncate mt-0.5">
+          {meta || <>{a.verb} <b className="text-gray-700">{a.venue}</b> → {b.verb} <b className="text-gray-700">{b.venue}</b></>}
+        </div>
+      </div>
+      <div className="text-right shrink-0">
+        <div className={`font-extrabold tabular ${diffTone(r)}`}>{fmtDiff(r.diff, r.active)}</div>
+        <div className={`text-[10px] uppercase tracking-wider ${ok ? "text-[var(--up)]" : r.blocked ? "text-[var(--down)]" : "text-gray-400"}`}>
+          {ok ? "✓ có đường" : r.blocked ? "không đường" : stepsOf(r) ? "hedge" : "chưa xác thực"}
+        </div>
+      </div>
+      <ChevronRight className={`w-4 h-4 shrink-0 ${selected ? "text-gray-900" : "text-gray-300"}`} />
+    </button>
+  );
+}
+
+// ── detail (right) ─────────────────────────────────────────────────────────
+
+function SideBox({ s }) {
+  return (
+    <a href={s.href} target="_blank" rel="noopener noreferrer" className="tile-inset flex-1 min-w-0 px-4 py-3 hover:bg-[var(--hover)] transition group">
+      <div className="flex items-center justify-between">
+        <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400">{s.verb}</span>
+        <ExternalLink className="w-3.5 h-3.5 text-gray-300 group-hover:text-gray-700" />
+      </div>
+      <div className="text-lg font-extrabold text-gray-900 truncate">{s.venue}</div>
+      <div className="text-[10px] font-bold uppercase tracking-wider text-gray-400">{s.kind}</div>
+      <div className="text-xl tabular text-gray-900 mt-1">{fmtP(s.price)}</div>
+      {s.liq != null && s.kind === "DEX" && <div className="text-[11px] text-gray-400">thanh khoản {fmtLiq(s.liq)}</div>}
+    </a>
+  );
+}
+
+function StepList({ steps }) {
+  return (
+    <ol className="flex flex-col">
+      {steps.map((st, i) => {
+        const warn = st.startsWith("⚠️");
+        const last = i === steps.length - 1;
+        return (
+          <li key={i} className="flex gap-3">
+            <div className="flex flex-col items-center">
+              <span className={`w-6 h-6 shrink-0 inline-flex items-center justify-center text-[11px] font-bold ${
+                warn ? "border-[1.5px] border-[var(--warn)] text-[var(--warn)]" : "bg-[var(--ink)] text-[var(--on-ink)]"}`}>
+                {warn ? "!" : i + 1}
+              </span>
+              {!last && <span className="w-[1.5px] flex-1 bg-[var(--line-2)] my-1" />}
+            </div>
+            <div className={`pb-3 pt-0.5 text-[14px] ${warn ? "text-[var(--warn)]" : "text-gray-800"}`}>
+              {st.replace(/^⚠️\s*/, "")}
+            </div>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+function Detail({ r, when, title, onBack }) {
+  const [a, b] = sides(r);
+  const steps = stepsOf(r);
+  const contracts = r.market === "CROSS"
+    ? [[`Contract ${r.buy_chain_short}`, r.buy_contract], [`Contract ${r.sell_chain_short}`, r.sell_contract]]
+    : [["Contract", r.contract]];
+  return (
+    <div className="flex flex-col gap-5">
+      {onBack && (
+        <button type="button" onClick={onBack} className="lg:hidden self-start inline-flex items-center gap-1 text-[12px] text-gray-500">
+          <ArrowLeft className="w-4 h-4" /> Danh sách
+        </button>
+      )}
+      {title && (
+        <div className="text-[12px] text-gray-500">
+          <span className="font-bold text-gray-700">{title}</span>{when ? ` · ${ago(when)} trước` : ""}
+        </div>
+      )}
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <h2 className="text-3xl font-extrabold tracking-wide text-gray-900">{r.symbol}</h2>
             {r.star && <span title="Đã đánh dấu">⭐</span>}
-            {r.note && <span title={r.note}>📝</span>}
           </div>
-          <div className="flex items-center gap-1 flex-wrap mt-1">
+          <div className="flex items-center gap-1 flex-wrap mt-2">
             <Badge tone="ink">{MARKET_LABEL[r.market]}</Badge>
             {r.priority === "HIGH" && <Badge tone="warn">High</Badge>}
             {r.reverse && r.active && <Badge tone="down">Ngược</Badge>}
@@ -155,79 +194,46 @@ function OppCard({ r }) {
             {!r.active && <Badge>Hết lệch</Badge>}
           </div>
         </div>
-        <div className="text-right shrink-0">
-          <div className={`text-2xl font-extrabold tabular leading-none ${diffTone}`}>
-            {r.diff >= 0 && r.active ? "+" : ""}{r.diff.toFixed(1)}%
-          </div>
-          <div className="text-[10px] uppercase tracking-wider text-gray-400 mt-1">
-            {r.market === "CROSS" ? "" : `liq ${fmtLiq(r.liquidity)}`}
-          </div>
+        <div className="text-right">
+          <div className={`text-4xl font-extrabold tabular leading-none ${diffTone(r)}`}>{fmtDiff(r.diff, r.active)}</div>
+          <div className="text-[11px] uppercase tracking-wider text-gray-400 mt-1">chênh lệch</div>
         </div>
-      </header>
+      </div>
 
       <div className="flex items-stretch gap-2">
         <SideBox s={a} />
-        <div className="flex items-center"><ArrowRight className="w-4 h-4 text-gray-400" /></div>
+        <div className="flex items-center"><ArrowRight className="w-5 h-5 text-gray-400" /></div>
         <SideBox s={b} />
       </div>
 
-      <div className="border-t-[1.5px] border-dashed border-[var(--line-2)] pt-2.5">
-        <RouteBlock r={r} />
-      </div>
+      <section>
+        <div className="label mb-2">{r.verified ? "Các bước" : r.market === "FT" && r.reverse ? "Cách vào (hedge)" : "Đường đi"}</div>
+        {steps ? (
+          <StepList steps={steps} />
+        ) : (
+          <div className={`tile-inset px-3 py-2.5 text-[13px] ${r.blocked ? "text-[var(--down)]" : "text-gray-600"}`}>
+            {r.blocked ? "⛔ Không có đường đi" : "❔ Chưa xác thực đường đi"}
+            {r.reason && <div className="text-gray-500 mt-1">{r.reason}</div>}
+          </div>
+        )}
+      </section>
 
-      <footer className="flex items-center gap-3 flex-wrap">
+      {r.note && (
+        <section>
+          <div className="label mb-1">Ghi chú</div>
+          <p className="text-[13px] text-gray-700">📝 {r.note}</p>
+        </section>
+      )}
+
+      <div className="flex items-center gap-2 flex-wrap pt-1">
         {r.bridge && (
-          <a href={r.bridge} target="_blank" rel="noopener noreferrer" className="btn-outline px-2.5 py-1 text-[11px] inline-flex items-center gap-1">
-            🌉 Cầu <ExternalLink className="w-3 h-3" />
+          <a href={r.bridge} target="_blank" rel="noopener noreferrer" className="btn-primary btn-sm px-3 py-1.5 text-[12px] inline-flex items-center gap-1">
+            🌉 Mở cầu <ExternalLink className="w-3.5 h-3.5" />
           </a>
         )}
-        <CopyBtn text={contract} label="Contract" />
-      </footer>
-    </article>
-  );
-}
-
-function AlertCard({ a }) {
-  const r = a.row;
-  const main = a.channel === "main";
-  return (
-    <article className={`tile-inset p-3 flex flex-col gap-2 ${main ? "" : "opacity-80"}`}>
-      <div className="flex items-center justify-between gap-2">
-        <Badge tone={main ? "up" : "line"}>{main ? "Đã báo" : "Log"}</Badge>
-        <span className="text-[11px] text-gray-400">{ago(a.ts)} trước</span>
+        {contracts.map(([label, c]) => <CopyBtn key={label} text={c} label={label} />)}
       </div>
-      <div className="font-bold text-[13px] text-gray-900 leading-snug">{a.title}</div>
-      {r ? (
-        <>
-          <div className="flex items-baseline justify-between gap-2">
-            <span className="font-extrabold">{r.symbol}</span>
-            <span className={`font-extrabold tabular ${r.reverse ? "text-[var(--down)]" : "text-[var(--up)]"}`}>
-              {r.diff >= 0 ? "+" : ""}{r.diff.toFixed(1)}%
-            </span>
-          </div>
-          <div className="flex items-center gap-1.5 text-[12px] flex-wrap">
-            {sides(r).map((s, i) => (
-              <span key={i} className="inline-flex items-center gap-1.5">
-                {i > 0 && <ArrowRight className="w-3 h-3 text-gray-300" />}
-                <a href={s.href} target="_blank" rel="noopener noreferrer" className="hover:underline">
-                  <span className="text-gray-400">{s.verb}</span> <b>{s.venue}</b> {fmtP(s.price)}
-                </a>
-              </span>
-            ))}
-          </div>
-          <RouteBlock r={r} />
-          {r.bridge && (
-            <a href={r.bridge} target="_blank" rel="noopener noreferrer" className="text-[11px] text-gray-500 hover:text-gray-900 inline-flex items-center gap-1">
-              🌉 Cầu <ExternalLink className="w-3 h-3" />
-            </a>
-          )}
-        </>
-      ) : (
-        <div className="text-[12px] text-gray-600 flex flex-col gap-0.5">
-          {a.lines.slice(0, 5).map((ln, i) => <span key={i}>{ln}</span>)}
-        </div>
-      )}
-    </article>
+    </div>
   );
 }
 
@@ -249,12 +255,15 @@ export default function Oppos() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [tab, setTab] = useState("opps");              // "opps" | "alerts"
   const [market, setMarket] = useState("ALL");
   const [onlyActive, setOnlyActive] = useState(true);
   const [onlyVerified, setOnlyVerified] = useState(false);
   const [showBlocked, setShowBlocked] = useState(false);
   const [showLog, setShowLog] = useState(false);
   const [query, setQuery] = useState("");
+  const [selected, setSelected] = useState(null);      // { kind: "row", key } | { kind: "alert", idx }
+  const [mobileDetail, setMobileDetail] = useState(false);
   const [, tick] = useState(0);
 
   // #key=… from the bot's /webkey link: keep it, then drop it from the address bar
@@ -318,6 +327,19 @@ export default function Oppos() {
 
   const alerts = useMemo(() => (data?.alerts || []).filter((a) => showLog || a.channel === "main"), [data, showLog]);
 
+  // Keep the selection on the same opportunity across refreshes; default to the first one
+  const current = useMemo(() => {
+    if (selected?.kind === "alert") {
+      const a = alerts[selected.idx];
+      if (a?.row) return { r: a.row, title: a.title, when: a.ts };
+    }
+    if (selected?.kind === "row") {
+      const r = (data?.rows || []).find((x) => rowKey(x) === selected.key);
+      if (r) return { r };
+    }
+    return rows[0] ? { r: rows[0] } : null;
+  }, [selected, alerts, data, rows]);
+
   if (!key) {
     return (
       <div className="font-sans px-4 py-10 flex justify-center">
@@ -337,74 +359,111 @@ export default function Oppos() {
   }
 
   const stale = data && Date.now() / 1000 - data.updated > 180;
+  const pick = (sel) => { setSelected(sel); setMobileDetail(true); };
 
   return (
     <div className="font-sans px-4 py-6 md:py-8 flex justify-center">
-      <div className="w-full max-w-[1240px] flex flex-col gap-5 min-w-0">
-        {/* Header + filters */}
-        <div className="flex flex-col gap-3">
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-            <h1 className="text-[26px] font-extrabold tracking-[0.08em] uppercase text-gray-900">Oppos</h1>
-            {data && (
-              <span className={`inline-flex items-center gap-1.5 text-[11px] uppercase tracking-wider ${stale ? "text-[var(--warn)]" : "text-gray-500"}`}>
-                <span className={`w-2 h-2 rounded-full ${stale ? "bg-[var(--warn)]" : "bg-[var(--up)] animate-pulse"}`} />
-                cập nhật {ago(data.updated)} trước{stale ? " · bot có thể đang dừng" : ""}
-              </span>
-            )}
-            <div className="ml-auto flex items-center gap-4">
-              <button type="button" onClick={load} className="text-gray-500 hover:text-gray-900 inline-flex items-center gap-1 text-[11px] uppercase tracking-wider">
-                <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} /> Tải lại
-              </button>
-              <button type="button" onClick={() => { saveKey(""); setKey(""); setData(null); }} className="text-[11px] uppercase tracking-wider text-gray-400 hover:text-gray-900">
-                Đổi khoá
-              </button>
-            </div>
+      <div className="w-full max-w-[1180px] flex flex-col gap-4 min-w-0">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <h1 className="text-[26px] font-extrabold tracking-[0.08em] uppercase text-gray-900">Oppos</h1>
+          {data && (
+            <span className={`inline-flex items-center gap-1.5 text-[11px] uppercase tracking-wider ${stale ? "text-[var(--warn)]" : "text-gray-500"}`}>
+              <span className={`w-2 h-2 rounded-full ${stale ? "bg-[var(--warn)]" : "bg-[var(--up)] animate-pulse"}`} />
+              cập nhật {ago(data.updated)} trước{stale ? " · bot có thể đang dừng" : ""}
+            </span>
+          )}
+          <div className="ml-auto flex items-center gap-4">
+            <button type="button" onClick={load} className="text-gray-500 hover:text-gray-900 inline-flex items-center gap-1 text-[11px] uppercase tracking-wider">
+              <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} /> Tải lại
+            </button>
+            <button type="button" onClick={() => { saveKey(""); setKey(""); setData(null); }} className="text-[11px] uppercase tracking-wider text-gray-400 hover:text-gray-900">
+              Đổi khoá
+            </button>
           </div>
+        </div>
+        {error && <p className="text-sm text-[var(--down)]">{error}</p>}
 
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="flex flex-wrap">
-              {MARKETS.map(([m, label]) => (
+        <div className="grid grid-cols-1 lg:grid-cols-[400px_1fr] gap-5 items-start">
+          {/* ── List ── */}
+          <section className={`tile relative p-4 flex flex-col gap-3 min-w-0 ${mobileDetail ? "hidden lg:flex" : ""}`}>
+            <div className="flex border-b-[1.5px] border-[var(--line-2)] -mx-4 px-4">
+              {[["opps", `Kèo ${counts.ALL}`], ["alerts", `Tin mới ${alerts.length}`]].map(([t, label]) => (
                 <button
-                  key={m}
+                  key={t}
                   type="button"
-                  onClick={() => setMarket(m)}
-                  className={`px-3 py-1.5 text-[11px] font-bold uppercase tracking-wider border-[1.5px] -ml-[1.5px] first:ml-0 ${
-                    market === m ? "chip-on border-[var(--line)] relative z-10" : "border-[var(--line-2)] text-gray-500 hover:text-gray-900"}`}
+                  onClick={() => setTab(t)}
+                  className={`px-3 pb-2 text-[12px] font-bold uppercase tracking-wider border-b-[2.5px] -mb-[1.5px] ${
+                    tab === t ? "border-[var(--ink)] text-gray-900" : "border-transparent text-gray-400 hover:text-gray-700"}`}
                 >
-                  {label} <span className="opacity-60">{counts[m]}</span>
+                  {label}
                 </button>
               ))}
             </div>
-            <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Tìm coin…" className="tile-inset px-3 py-1.5 text-sm w-40" />
-            <Toggle on={onlyActive} onChange={setOnlyActive}>Đang lệch</Toggle>
-            <Toggle on={onlyVerified} onChange={setOnlyVerified}>✓ Có đường</Toggle>
-            <Toggle on={showBlocked} onChange={setShowBlocked}>Kèo không có đường</Toggle>
-          </div>
-          {error && <p className="text-sm text-[var(--down)]">{error}</p>}
-        </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-[1fr_20rem] gap-5 items-start">
-          {/* Opportunity cards */}
-          <section className="grid grid-cols-1 md:grid-cols-2 gap-4 min-w-0">
-            {rows.map((r) => (
-              <OppCard key={`${r.market}|${r.symbol}|${r.cex || r.buy_chain}|${r.contract || r.buy_contract}`} r={r} />
-            ))}
-            {data && !rows.length && <p className="text-sm text-gray-500 py-10 text-center md:col-span-2">Không có kèo nào khớp bộ lọc.</p>}
-            {!data && !error && <p className="text-sm text-gray-500 py-10 text-center md:col-span-2">Đang tải…</p>}
+            {tab === "opps" ? (
+              <>
+                <div className="flex flex-wrap gap-1.5">
+                  {MARKETS.map(([m, label]) => (
+                    <Toggle key={m} on={market === m} onChange={() => setMarket(m)}>
+                      {label} <span className="opacity-60">{counts[m]}</span>
+                    </Toggle>
+                  ))}
+                </div>
+                <div className="flex flex-wrap gap-1.5 items-center">
+                  <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Tìm coin…" className="tile-inset px-2.5 py-1 text-sm w-32" />
+                  <Toggle on={onlyActive} onChange={setOnlyActive}>Đang lệch</Toggle>
+                  <Toggle on={onlyVerified} onChange={setOnlyVerified}>✓ Có đường</Toggle>
+                  <Toggle on={showBlocked} onChange={setShowBlocked}>+ Không đường</Toggle>
+                </div>
+                <div className="flex flex-col gap-2 lg:max-h-[68vh] overflow-y-auto -mr-2 pr-2 pb-1">
+                  {rows.map((r) => (
+                    <ListItem
+                      key={rowKey(r)}
+                      r={r}
+                      selected={current?.r && !current.title && rowKey(current.r) === rowKey(r)}
+                      onClick={() => pick({ kind: "row", key: rowKey(r) })}
+                    />
+                  ))}
+                  {data && !rows.length && <p className="text-sm text-gray-500 py-8 text-center">Không có kèo nào khớp bộ lọc.</p>}
+                  {!data && !error && <p className="text-sm text-gray-500 py-8 text-center">Đang tải…</p>}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] text-gray-500">Tin bot vừa báo, mới nhất trước</span>
+                  <Toggle on={showLog} onChange={setShowLog}>+ Log</Toggle>
+                </div>
+                <div className="flex flex-col gap-2 lg:max-h-[68vh] overflow-y-auto -mr-2 pr-2 pb-1">
+                  {alerts.map((a, i) => (a.row ? (
+                    <ListItem
+                      key={`${a.ts}-${i}`}
+                      r={a.row}
+                      selected={selected?.kind === "alert" && selected.idx === i}
+                      onClick={() => pick({ kind: "alert", idx: i })}
+                      meta={<>{a.title.slice(0, 48)} · {ago(a.ts)}</>}
+                    />
+                  ) : (
+                    <div key={`${a.ts}-${i}`} className="px-3 py-2.5 border-[1.5px] border-[var(--line-2)] bg-[var(--surface)] text-[12px]">
+                      <div className="flex justify-between gap-2"><b className="text-gray-800">{a.title}</b><span className="text-gray-400">{ago(a.ts)}</span></div>
+                      {a.lines.slice(0, 3).map((ln, j) => <div key={j} className="text-gray-500">{ln}</div>)}
+                    </div>
+                  )))}
+                  {data && !alerts.length && <p className="text-sm text-gray-500 py-8 text-center">Chưa có tin nào.</p>}
+                </div>
+              </>
+            )}
           </section>
 
-          {/* Recent alerts */}
-          <aside className="tile relative p-4 flex flex-col gap-3 lg:sticky lg:top-28">
-            <span className="tile-tab"><b>NEW</b>Kèo mới</span>
-            <div className="flex items-center justify-between">
-              <span className="text-[11px] uppercase tracking-wider text-gray-500">Tin bot vừa báo</span>
-              <Toggle on={showLog} onChange={setShowLog}>+ Log</Toggle>
-            </div>
-            <div className="flex flex-col gap-2.5 max-h-[70vh] overflow-y-auto -mr-1 pr-1">
-              {alerts.map((a, i) => <AlertCard key={`${a.ts}-${i}`} a={a} />)}
-              {data && !alerts.length && <p className="text-[12px] text-gray-500 py-4 text-center">Chưa có tin nào.</p>}
-            </div>
-          </aside>
+          {/* ── Detail ── */}
+          <section className={`tile relative p-5 md:p-6 min-w-0 lg:sticky lg:top-28 ${mobileDetail ? "" : "hidden lg:block"}`}>
+            <span className="tile-tab"><b>02</b>Chi tiết</span>
+            {current ? (
+              <Detail r={current.r} title={current.title} when={current.when} onBack={() => setMobileDetail(false)} />
+            ) : (
+              <p className="text-sm text-gray-500 py-10 text-center">Chọn một kèo bên trái để xem đường đi.</p>
+            )}
+          </section>
         </div>
       </div>
     </div>
