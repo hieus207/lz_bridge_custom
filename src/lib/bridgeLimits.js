@@ -7,7 +7,7 @@
 //   Wormhole   NTT manager outbound / per-chain inbound capacity; Portal → Governor USD cap per chain
 //   Hyperlane  RateLimited router / hook / ISM, collateral liquidity
 import { ethers } from "ethers";
-import { CHAINS, CHAIN_LIST, chainName, anyChainName, chainIdFromLzKey } from "./chains";
+import { CHAINS, CHAIN_LIST, chainName, anyChainName, chainIdFromLzKey, SOLANA } from "./chains";
 import { cached, fetchJson } from "./http";
 import { multicall, ERC20 } from "./onchain";
 import { pickWorkingRpc } from "./bridgeScan";
@@ -52,9 +52,11 @@ export const fmtWindow = (sec) => {
 };
 
 // ok | low (<10% left) | blocked (nothing can pass) | unlimited
-function statusOf(available, capacity) {
+// A capacity below 0.0001 token is a lane switched off by setting a dust limit.
+function statusOf(available, capacity, decimals) {
   if (capacity == null) return "unlimited";
   if (capacity === 0n || available === 0n) return "blocked";
+  if (decimals != null && capacity < 10n ** BigInt(Math.max(decimals - 4, 0))) return "blocked";
   if (available != null && available * 10n < capacity) return "low";
   return "ok";
 }
@@ -133,7 +135,7 @@ async function lzLimits({ address, chainId, provider, decimals, rpcUrl }) {
     }
     const maxTx = quote ? BigInt(quote[0][1]) : null;
     if (maxTx != null && maxTx !== UINT64_MAX && maxTx !== UINT256_MAX) row.maxTx = maxTx;
-    row.status = paused === true ? "blocked" : statusOf(row.available, row.capacity);
+    row.status = paused === true ? "blocked" : statusOf(row.available, row.capacity, decimals);
     if (paused === true) row.note = "OFT paused";
 
     // Destination side (chains we have RPCs for): inbound limiter + adapter liquidity
@@ -176,15 +178,30 @@ async function lzLimits({ address, chainId, provider, decimals, rpcUrl }) {
 }
 
 // ─── Chainlink CCIP ──────────────────────────────────────────────────────────
+//
+// A lane A → B is capped twice: A's pool outbound bucket for B and B's pool inbound bucket
+// for A. Rows show the tighter of the two, per direction, read from both pools.
 
-const loadCcipSelectors = () => cached("ccip-chains", async () => {
+const CCIP_SOLANA = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d"; // CCIP keys Solana by genesis hash
+
+const loadCcipChains = () => cached("ccip-chains", async () => {
   const json = await fetchJson("https://docs.chain.link/api/ccip/v1/chains?environment=mainnet", { timeout: 20000 });
-  const map = new Map();
+  const nameBySel = new Map();
+  const selByChain = new Map(); // directory chain key (EVM id or Solana genesis) → selector
   for (const family of Object.values(json.data || {})) {
-    for (const c of Object.values(family)) if (c.selector) map.set(String(c.selector), c.displayName);
+    for (const [key, c] of Object.entries(family)) {
+      if (!c.selector) continue;
+      nameBySel.set(String(c.selector), c.displayName);
+      selByChain.set(String(key), BigInt(c.selector));
+    }
   }
-  return map;
+  return { nameBySel, selByChain };
 });
+
+// Same token on every chain, from the CCIP directory (keyed by directory chain key)
+const loadCcipToken = (symbol) => cached(`ccip-token:${symbol}`, () =>
+  fetchJson(`https://docs.chain.link/api/ccip/v1/tokens/${encodeURIComponent(symbol)}?environment=mainnet`, { timeout: 20000 })
+    .then((j) => j.data || {}));
 
 const BUCKET = "(uint128 tokens, uint32 lastUpdated, bool isEnabled, uint128 capacity, uint128 rate)";
 const CCIP = new ethers.Interface([
@@ -196,50 +213,173 @@ const CCIP = new ethers.Interface([
   `function getCurrentRateLimiterState(uint64, bool) view returns (${BUCKET}, ${BUCKET})`,
 ]);
 
+// { available, capacity, rate } in the pool's own decimals; capacity null = limiter off
 const bucket = (b) => {
   if (!b) return null;
   const enabled = b.isEnabled ?? b[2];
   if (!enabled) return { capacity: null };
-  const rate = BigInt(b.rate ?? b[4]);
-  return { available: BigInt(b.tokens ?? b[0]), capacity: BigInt(b.capacity ?? b[3]), rate };
+  return { available: BigInt(b.tokens ?? b[0]), capacity: BigInt(b.capacity ?? b[3]), rate: BigInt(b.rate ?? b[4]) };
+};
+const rescale = (b, from, to) => {
+  if (!b || b.capacity == null || from == null || to == null || from === to) return b;
+  const f = (x) => (to > from ? x * 10n ** BigInt(to - from) : x / 10n ** BigInt(from - to));
+  return { available: f(b.available), capacity: f(b.capacity), rate: f(b.rate) };
+};
+// Tighter of two buckets (null = not read, capacity null = unlimited)
+const tighter = (a, b) => {
+  if (!a || a.capacity == null) return b && b.capacity != null ? b : a || b;
+  if (!b || b.capacity == null) return a;
+  return b.available < a.available ? b : a;
 };
 
-async function ccipLimits({ address, provider, decimals }) {
-  const [tv, token, sels] = await multicall(provider, [
-    { target: address, iface: CCIP, fn: "typeAndVersion" },
-    { target: address, iface: CCIP, fn: "getToken" },
-    { target: address, iface: CCIP, fn: "getSupportedChains" },
+// EVM pool: outbound + inbound buckets for one remote selector
+async function evmPoolBuckets(provider, pool, sel) {
+  const [o1, i1, v2] = await multicall(provider, [
+    { target: pool, iface: CCIP, fn: "getCurrentOutboundRateLimiterState", args: [sel] },
+    { target: pool, iface: CCIP, fn: "getCurrentInboundRateLimiterState", args: [sel] },
+    { target: pool, iface: CCIP, fn: "getCurrentRateLimiterState", args: [sel, false] },
   ]);
-  if (!sels?.length) return { rows: [], notes: ["Pool has no remote chains configured"] };
-  const names = await loadCcipSelectors().catch(() => new Map());
-  const calls = sels.flatMap((s) => [
-    { target: address, iface: CCIP, fn: "getCurrentOutboundRateLimiterState", args: [s] },
-    { target: address, iface: CCIP, fn: "getCurrentInboundRateLimiterState", args: [s] },
-    { target: address, iface: CCIP, fn: "getCurrentRateLimiterState", args: [s, false] },
-  ]);
-  const res = await multicall(provider, calls);
-  const refill = (b) => (b?.rate != null && b.capacity ? `+${fmtAmount(b.rate, decimals)}/s (full in ${fmtDuration(b.capacity / (b.rate || 1n))})` : null);
+  return { out: bucket(o1 ?? v2?.[0]), in: bucket(i1 ?? v2?.[1]) };
+}
 
-  const rows = sels.map((s, i) => {
-    const [o1, i1, v2] = res.slice(i * 3, i * 3 + 3);
-    const out = bucket(o1 ?? v2?.[0]);
-    const inn = bucket(i1 ?? v2?.[1]);
-    const name = names.get(String(s)) || `selector ${s}`;
+// Solana pool: per-remote-chain config PDA ["ccip_tokenpool_chainconfig", selector LE, mint].
+// Borsh: disc 8 | pool_addresses Vec<Vec<u8>> | token_address Vec<u8> | decimals u8 |
+//        inbound {tokens u64, last_updated u64, enabled u8, capacity u64, rate u64} | outbound {…}
+const SOLANA_RPC_URLS = ["https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"];
+async function solanaConnection() {
+  const { Connection } = await import("@solana/web3.js");
+  for (const url of SOLANA_RPC_URLS) {
+    const c = new Connection(url, "confirmed");
+    try { await withTimeout(c.getSlot(), 6000, "solana"); return c; } catch { /* next */ }
+  }
+  throw new Error("No Solana RPC reachable");
+}
+
+function decodeSolanaChainConfig(data, now) {
+  let o = 8;
+  const u32 = () => { const v = data.readUInt32LE(o); o += 4; return v; };
+  const u64 = () => { const v = data.readBigUInt64LE(o); o += 8; return v; };
+  const n = u32();
+  const skip = () => { const len = u32(); o += len; };
+  for (let i = 0; i < n; i++) skip();
+  skip();
+  o += 1;
+  const readBucket = () => {
+    const tokens = u64(); const last = u64(); const enabled = data[o++] === 1; const capacity = u64(); const rate = u64();
+    if (!enabled) return { capacity: null };
+    const elapsed = BigInt(now) > last ? BigInt(now) - last : 0n;
+    const refilled = tokens + elapsed * rate;
+    return { available: refilled > capacity ? capacity : refilled, capacity, rate };
+  };
+  const inbound = readBucket();
+  const outbound = readBucket();
+  return { out: outbound, in: inbound };
+}
+
+async function solanaPoolBuckets(conn, poolState, mint, sels) {
+  const { PublicKey } = await import("@solana/web3.js");
+  const info = await conn.getAccountInfo(new PublicKey(poolState));
+  if (!info) throw new Error("CCIP pool account not found on Solana");
+  const program = info.owner;
+  const mintKey = new PublicKey(mint);
+  const pdas = sels.map((sel) => {
+    const s = new Uint8Array(8);
+    new DataView(s.buffer).setBigUint64(0, sel, true);
+    return PublicKey.findProgramAddressSync([new TextEncoder().encode("ccip_tokenpool_chainconfig"), s, mintKey.toBytes()], program)[0];
+  });
+  const accts = await conn.getMultipleAccountsInfo(pdas);
+  const now = Math.floor(Date.now() / 1000);
+  // Lock/release liquidity sits in the pool signer's token account
+  const [signer] = PublicKey.findProgramAddressSync([new TextEncoder().encode("ccip_tokenpool_signer"), mintKey.toBytes()], program);
+  const held = await conn.getParsedTokenAccountsByOwner(signer, { mint: mintKey })
+    .then((r) => r.value.reduce((s, a) => s + BigInt(a.account.data.parsed.info.tokenAmount.amount), 0n))
+    .catch(() => null);
+  return { buckets: accts.map((a) => (a ? decodeSolanaChainConfig(a.data, now) : null)), held };
+}
+
+async function ccipLimits({ address, chainId, token, provider, decimals, finding }) {
+  const isSolana = chainId === SOLANA;
+  const here = isSolana ? CCIP_SOLANA : String(chainId);
+  const symbol = finding?.details?.find(([k]) => k === "Symbol")?.[1];
+  const [{ nameBySel, selByChain }, directory] = await Promise.all([
+    loadCcipChains(),
+    symbol ? loadCcipToken(symbol).catch(() => ({})) : Promise.resolve({}),
+  ]);
+  // The directory entry for this exact token (symbols are not unique)
+  const self = directory[here] && lc(directory[here].tokenAddress) === lc(token) ? directory[here] : null;
+  const hereSel = selByChain.get(here);
+  const notes = [];
+
+  // This pool's buckets per remote selector
+  let sels;
+  let local;
+  let tv = null;
+  if (isSolana) {
+    sels = (self?.destinations || []).map((d) => selByChain.get(String(d))).filter(Boolean);
+    if (!sels.length) return { rows: [], notes: ["Remote chains unknown (token not in the CCIP directory)"] };
+    const conn = await solanaConnection();
+    const { buckets, held } = await solanaPoolBuckets(conn, address, token, sels);
+    local = buckets;
+    tv = finding?.title?.match(/\((.+)\)/)?.[1] || null;
+    if (/LockRelease/i.test(tv || "") && held != null) notes.push(`Liquidity in this lock/release pool: ${fmtAmount(held, decimals)} (max that can arrive on Solana)`);
+  } else {
+    const [v, poolToken, s] = await multicall(provider, [
+      { target: address, iface: CCIP, fn: "typeAndVersion" },
+      { target: address, iface: CCIP, fn: "getToken" },
+      { target: address, iface: CCIP, fn: "getSupportedChains" },
+    ]);
+    tv = v;
+    sels = (s || []).map((x) => BigInt(x));
+    if (!sels.length) return { rows: [], notes: ["Pool has no remote chains configured"] };
+    local = await Promise.all(sels.map((sel) => evmPoolBuckets(provider, address, sel)));
+    if (/LockRelease/i.test(tv || "") && poolToken) {
+      const [bal] = await multicall(provider, [{ target: poolToken, iface: ERC20, fn: "balanceOf", args: [address] }]);
+      if (bal != null) notes.push(`Liquidity in this lock/release pool: ${fmtAmount(BigInt(bal), decimals)} (max that can arrive on ${chainName(chainId)})`);
+    }
+  }
+  if (tv) notes.unshift(tv);
+
+  // Remote pools (from the directory) for the other half of each lane
+  const remoteBySel = new Map();
+  if (self && hereSel != null) {
+    await Promise.all(Object.entries(directory).map(async ([key, e]) => {
+      if (key === here || !e.pool?.address) return;
+      const sel = selByChain.get(key);
+      if (sel == null || !sels.includes(sel)) return;
+      try {
+        let b = null;
+        if (key === CCIP_SOLANA) {
+          const conn = await solanaConnection();
+          b = (await solanaPoolBuckets(conn, e.pool.address, e.tokenAddress, [hereSel])).buckets[0];
+        } else if (CHAINS[key]) {
+          const p = await withTimeout(providerFor(Number(key)), 10000, "rpc");
+          if (p) b = await withTimeout(evmPoolBuckets(p, e.pool.address, hereSel), 10000, "pool");
+        }
+        if (b) remoteBySel.set(sel, { out: rescale(b.out, e.decimals, decimals), in: rescale(b.in, e.decimals, decimals) });
+      } catch { /* remote side unreadable: show this pool only */ }
+    }));
+  }
+
+  const refill = (b) => (b?.rate && b.capacity ? `+${fmtAmount(b.rate, decimals)}/s (full in ${fmtDuration(b.capacity / b.rate)})` : null);
+  const rows = sels.map((sel, i) => {
+    const mine = local[i] || {};
+    const remote = remoteBySel.get(sel);
+    const name = nameBySel.get(String(sel)) || `selector ${sel}`;
+    const out = tighter(mine.out, remote?.in);
+    const inn = tighter(remote?.out, mine.in);
     const row = { route: `⇄ ${name}`, dir: "both" };
     if (out) Object.assign(row, { available: out.available, capacity: out.capacity, refill: refill(out) });
     if (inn) row.inbound = { available: inn.available, capacity: inn.capacity, refill: refill(inn) };
-    const st = [statusOf(row.available, row.capacity), statusOf(inn?.available, inn?.capacity)];
+    const by = [];
+    if (remote && out && out === remote.in && out.capacity != null) by.push(`send capped by ${name} pool`);
+    if (remote && inn && inn === remote.out && inn.capacity != null) by.push(`receive capped by ${name} pool`);
+    if (by.length) row.note = by.join(" · ");
+    if (!remote) row.note = `${name} side not checked`;
+    const st = [statusOf(row.available, row.capacity, decimals), statusOf(inn?.available, inn?.capacity, decimals)];
     row.status = st.includes("blocked") ? "blocked" : st.includes("low") ? "low" : st.every((x) => x === "unlimited") ? "unlimited" : "ok";
     return row;
   });
-
-  const notes = [];
-  if (tv) notes.push(tv);
-  if (/LockRelease/i.test(tv || "") && token) {
-    const [bal] = await multicall(provider, [{ target: token, iface: ERC20, fn: "balanceOf", args: [address] }]);
-    if (bal != null) notes.push(`Liquidity in this lock/release pool: ${fmtAmount(BigInt(bal), decimals)} (max that can arrive here)`);
-  }
-  return { rows, notes, legend: "→ out of this chain · ← into this chain" };
+  return { rows, notes, legend: "Top = can send to that chain now · in = can receive from it (tighter of both pools)" };
 }
 
 const fmtDuration = (secBig) => {
@@ -437,9 +577,10 @@ async function hyperlaneLimits({ address, chainId, provider, decimals }) {
 
 const PORTAL_TITLES = /Portal|Token Bridge/;
 
-// Which findings have a limit worth reading.
-export function limitKind(protocol, f) {
+// Which findings have a limit worth reading (Solana: CCIP pools so far).
+export function limitKind(protocol, f, chainId) {
   if (f.confidence === "low") return null;
+  if (chainId === SOLANA) return protocol === "Chainlink CCIP" && f.address && /pool/i.test(f.title) ? "ccip" : null;
   if (protocol === "LayerZero" && f.address && /OFT/.test(f.title)) return "lz";
   if (protocol === "Chainlink CCIP" && f.address && /pool/i.test(f.title)) return "ccip";
   if (protocol === "Wormhole" && (/NTT/.test(f.title))) return "ntt";
@@ -449,9 +590,10 @@ export function limitKind(protocol, f) {
 }
 
 export async function readLimits({ kind, finding, token, chainId, rpcUrl, decimals }) {
+  if (chainId === SOLANA) return ccipLimits({ address: finding.address, token, chainId, decimals, finding });
   const provider = await withTimeout(providerFor(chainId, rpcUrl), 15000, "rpc");
   if (!provider) throw new Error("No RPC reachable");
-  const args = { address: finding.address, token, chainId, provider, decimals, rpcUrl };
+  const args = { address: finding.address, token, chainId, provider, decimals, rpcUrl, finding };
   switch (kind) {
     case "lz": return lzLimits(args);
     case "ccip": return ccipLimits(args);

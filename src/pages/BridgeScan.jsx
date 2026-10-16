@@ -193,7 +193,7 @@ const CONFIDENCE_STYLE = {
 
 function FindingCard({ f, chainId, protocol, limitCtx }) {
   const app = f.appUrl || PROTOCOL_APPS[protocol];
-  const kind = limitCtx ? limitKind(protocol, f) : null;
+  const kind = limitCtx ? limitKind(protocol, f, limitCtx.chainId) : null;
   return (
     <div className="bg-[var(--surface)] border-[1.5px] border-[var(--line-2)] px-3 py-2.5 flex flex-col gap-2 text-xs">
       <div className="flex items-start justify-between gap-2">
@@ -424,8 +424,8 @@ export default function BridgeScan() {
 
   const detected = scan ? PROTOCOL_KEYS.filter((k) => scan.protocols[k].findings.some((f) => f.confidence !== "low")) : [];
   const meta = scan?.meta;
-  // Limits are read from the contracts once the scan settles (EVM chains only)
-  const limitCtx = meta?.done && scanCtx && scanCtx.chainId !== SOLANA && meta.rpcUrl
+  // Limits are read from the contracts once the scan settles
+  const limitCtx = meta?.done && scanCtx && (scanCtx.chainId === SOLANA || meta.rpcUrl)
     ? { token: scanCtx.token, chainId: scanCtx.chainId, rpcUrl: meta.rpcUrl, decimals: meta.token?.decimals ?? 18 }
     : null;
   const split = !!scanCtx; // centred form until the first scan, then form left / results right
