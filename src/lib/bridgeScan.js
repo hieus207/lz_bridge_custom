@@ -6,7 +6,7 @@
 // breaking it, and the UI shows which source produced each finding.
 import { ethers } from "ethers";
 import {
-  CHAINS, CHAIN_LIST, getRpcs, chainName, chainIdFromLzKey, chainIdFromWormholeId, anyChainName,
+  CHAINS, CHAIN_LIST, getRpcs, chainName, chainIdFromLzKey, chainIdFromWormholeId, anyChainName, SOLANA,
 } from "./chains";
 import { cached, fetchJson, fetchWithTimeout } from "./http";
 import { makeProvider, multicall, probeContracts, classify, ERC20 } from "./onchain";
@@ -200,11 +200,36 @@ const WRAPPED_IFACE = new ethers.Interface([
   "function nativeContract() view returns (bytes32)",
 ]);
 
+const WH_SOLANA_TOKEN_BRIDGE = "wormDTUJ6AWPNvk59vGQbDvGJmqbDTdgWgAqcLBCgUb";
+const SOLANA_RPC_URLS = ["https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"];
+
+// Portal-wrapped mint on Solana = PDA ["wrapped", origin chain u16 BE, origin address 32].
+async function solanaWrappedMint(originWh, token32) {
+  const { PublicKey, Connection } = await import("@solana/web3.js");
+  const chain = new Uint8Array(2);
+  new DataView(chain.buffer).setUint16(0, originWh, false);
+  const [mint] = PublicKey.findProgramAddressSync(
+    [new TextEncoder().encode("wrapped"), chain, ethers.getBytes(token32)],
+    new PublicKey(WH_SOLANA_TOKEN_BRIDGE)
+  );
+  for (const url of SOLANA_RPC_URLS) {
+    try {
+      const info = await withTimeout(new Connection(url, "confirmed").getAccountInfo(mint), 8000, "solana");
+      return info ? mint.toBase58() : null;
+    } catch { /* next rpc */ }
+  }
+  return null;
+}
+
 // Where a token from Wormhole chain `originWh` (32-byte address) has a Portal-wrapped
-// version, asked directly to each EVM Token Bridge.
+// version, asked directly to each Token Bridge (EVM chains + Solana).
 export async function wormholeAttestations(originWh, token32, excludeChainId) {
   const others = CHAIN_LIST.filter((c) => c.id !== excludeChainId && c.wormhole);
-  const checks = await Promise.all(others.map(async (c) => {
+  const solana = originWh === 1 ? Promise.resolve(null)
+    : solanaWrappedMint(originWh, token32)
+      .then((mint) => (mint ? { chain: { id: SOLANA, name: "Solana" }, wrapped: mint } : null))
+      .catch(() => null);
+  const checks = await Promise.all([solana, ...others.map(async (c) => {
     for (const rpc of getRpcs(c.id).slice(0, 2)) {
       try {
         const p = makeProvider(rpc, c.id);
@@ -216,8 +241,35 @@ export async function wormholeAttestations(originWh, token32, excludeChainId) {
       } catch { /* next rpc */ }
     }
     return null;
-  }));
+  })]);
   return checks.filter(Boolean);
+}
+
+// WormholeScan's "secured tokens" are keyed by CoinGecko id, so a token listed there as
+// PORTAL_TOKEN_BRIDGE often has no wrapped pair at all — Portal's UI then routes it through
+// Mayan Swift, a cross-chain swap, not a 1:1 bridge. Portal counts only with on-chain proof
+// (wrapped token, attested elsewhere, or locked in the Token Bridge); NTT stays as listed.
+const PORTAL_PROOF = /Wormhole-wrapped token|attested on Portal|Locked in Wormhole Token Bridge/;
+export function finalizeWormhole(state, { verified }) {
+  const wh = state.protocols.Wormhole;
+  const listedPortal = wh.findings.filter((f) =>
+    f.sources.length === 1 && f.sources[0] === "WormholeScan" && f.details.some(([k, v]) => k === "Type" && v === "PORTAL_TOKEN_BRIDGE"));
+  if (!listedPortal.length) return;
+  wh.findings = wh.findings.filter((f) => !listedPortal.includes(f));
+  if (wh.findings.some((f) => f.confidence !== "low" && PORTAL_PROOF.test(f.title))) return; // proven on-chain
+  wh.findings.push({
+    protocol: "Wormhole",
+    title: "No Portal pair (WormholeScan listing only)",
+    confidence: "low",
+    sources: ["WormholeScan"],
+    details: [
+      ["Symbol", listedPortal[0].details.find(([k]) => k === "Symbol")?.[1] || "?"],
+      ["Why", verified
+        ? "Not wrapped or attested on any Token Bridge — Portal would route it via Mayan Swift (cross-chain swap, not 1:1)"
+        : "Token Bridge could not be checked on-chain; a listing alone is not a 1:1 bridge"],
+    ],
+    destinations: [],
+  });
 }
 
 // Authoritative Portal check straight from the Token Bridge contracts.
@@ -415,6 +467,7 @@ export async function scanToken({ token, chainId, rpcUrl, proxyBase, onState }) 
   const provider = picked?.provider || null;
   setMeta({
     rpc: picked ? hostOf(picked.url) : null,
+    rpcUrl: picked?.url || null,
     rpcNote: rpcUrl && picked && picked.url !== rpcUrl ? `${hostOf(rpcUrl)} unreachable, switched` : null,
   });
   if (picked) rpcUrl = picked.url;
@@ -433,6 +486,7 @@ export async function scanToken({ token, chainId, rpcUrl, proxyBase, onState }) 
   }
 
   await Promise.all(tasks);
+  finalizeWormhole(state, { verified: !!(provider && chain?.wormhole) });
   setMeta({ progress: null, done: true });
   return state;
 }

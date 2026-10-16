@@ -5,7 +5,7 @@ import { ethers } from "ethers";
 import { Buffer } from "buffer";
 import { CHAIN_LIST, chainName, chainIdFromWormholeId, anyChainName } from "./chains";
 import {
-  createScan, loadCcip, loadHyperlane, loadLzTransfer, loadWormholeScan, wormholeAttestations,
+  createScan, loadCcip, loadHyperlane, loadLzTransfer, loadWormholeScan, wormholeAttestations, finalizeWormhole,
 } from "./bridgeScan";
 import { makeSolana, resolveSolanaOft, getPeers, isSolanaAddress, SOLANA_RPCS } from "./solanaOft";
 
@@ -196,6 +196,7 @@ export async function scanSolanaToken({ mint, rpcUrl = SOLANA_RPCS[0], onState }
     run(["Wormhole"], () => wormholeSolanaOnchain(sol, mint)),
     run(["Hyperlane"], () => hyperlaneSolana(mint)),
   ]);
+  finalizeWormhole(state, { verified: true });
 
   // Symbol from whichever registry knew the token
   const sym = Object.values(state.protocols).flatMap((p) => p.findings)

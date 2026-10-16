@@ -9,6 +9,7 @@ import useCustomChains from "../hooks/useCustomChains";
 import { CHAINS, CHAIN_LIST, getRpcs, explorerAddressUrl, chainName, SOLANA, isBase58Address } from "../lib/chains";
 import { getCustomChain, removeCustomChain } from "../lib/customChains";
 import { scanToken, PROTOCOL_KEYS } from "../lib/bridgeScan";
+import { limitKind, readLimits, fmtAmount, fmtUsd } from "../lib/bridgeLimits";
 
 const PROXY = process.env.REACT_APP_OKLINK_PROXY ||
   (process.env.NODE_ENV === "development" ? "http://localhost:3001" : "");
@@ -78,14 +79,121 @@ function Address({ value, chainId }) {
   );
 }
 
+const LIMIT_STATUS = {
+  ok: { label: "OK", cls: "text-[var(--up)] border-[var(--up)]" },
+  low: { label: "Low", cls: "text-[var(--warn)] border-[var(--warn)]" },
+  blocked: { label: "Blocked", cls: "text-white bg-[var(--down)] border-[var(--down)]" },
+  unlimited: { label: "No limit", cls: "text-gray-400 border-[var(--line-2)]" },
+};
+const STATUS_RANK = { blocked: 3, low: 2, ok: 1, unlimited: 0 };
+
+function StatusChip({ status }) {
+  const s = LIMIT_STATUS[status] || LIMIT_STATUS.unlimited;
+  return <span className={`px-1.5 py-px text-[10px] font-bold uppercase tracking-wider border-[1.5px] whitespace-nowrap ${s.cls}`}>{s.label}</span>;
+}
+
+// "available / capacity" for one direction
+function Amount({ available, capacity, decimals, usd }) {
+  if (usd) return <span className="tabular">{fmtUsd(available)} <span className="text-gray-400">/ {fmtUsd(capacity)}</span></span>;
+  if (capacity == null) return <span className="text-gray-400">no limit</span>;
+  return <span className="tabular">{fmtAmount(available, decimals)} <span className="text-gray-400">/ {fmtAmount(capacity, decimals)}</span></span>;
+}
+
+const COLLAPSED_LIMIT_ROWS = 6;
+
+// Live transfer limits of one finding; reads the contracts once the scan is finished.
+function LimitsPanel({ kind, f, ctx }) {
+  const [state, setState] = useState({ loading: true });
+  const [showAll, setShowAll] = useState(false);
+  const run = () => {
+    setState({ loading: true });
+    readLimits({ kind, finding: f, token: ctx.token, chainId: ctx.chainId, rpcUrl: ctx.rpcUrl, decimals: ctx.decimals })
+      .then((r) => setState({ ...r, loading: false }))
+      .catch((err) => setState({ loading: false, error: err?.shortMessage || err?.message || String(err) }));
+  };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(run, [kind, f.address, ctx.token, ctx.chainId]);
+
+  const rows = [...(state.rows || [])].sort((a, b) => STATUS_RANK[b.status] - STATUS_RANK[a.status]);
+  const worst = rows[0]?.status;
+  const shown = showAll ? rows : rows.slice(0, COLLAPSED_LIMIT_ROWS);
+  const dec = ctx.decimals;
+
+  return (
+    <div className="border-t-[1.5px] border-dashed border-[var(--line-2)] pt-2 flex flex-col gap-1.5">
+      <div className="flex items-center gap-2">
+        <span className="text-gray-400 uppercase text-[10px] tracking-wider">Transfer limits</span>
+        {state.loading ? (
+          <span className="text-[10px] text-gray-400">reading…</span>
+        ) : rows.length ? (
+          <StatusChip status={worst} />
+        ) : null}
+        {!state.loading && (
+          <button type="button" onClick={run} className="ml-auto text-[10px] text-gray-400 hover:text-gray-900 uppercase tracking-wider">
+            Refresh
+          </button>
+        )}
+      </div>
+      {state.error && <p className="text-[11px] text-[var(--warn)]">Could not read limits: {state.error}</p>}
+      {rows.length > 0 && (
+        <div className="overflow-x-auto">
+          <table className="w-full text-[11px]">
+            <thead>
+              <tr className="text-gray-400 text-[10px] uppercase tracking-wider text-left">
+                <th className="font-normal pr-2 py-0.5">Route</th>
+                <th className="font-normal pr-2 py-0.5">Available now</th>
+                <th className="font-normal pr-2 py-0.5">Refill</th>
+                <th className="font-normal py-0.5" />
+              </tr>
+            </thead>
+            <tbody>
+              {shown.map((r) => (
+                <tr key={r.route} className="border-t border-[var(--line-2)] align-top">
+                  <td className="pr-2 py-1 whitespace-nowrap font-bold text-gray-700">{r.route}</td>
+                  <td className="pr-2 py-1 text-gray-700">
+                    {r.usd ? (
+                      <Amount usd available={r.availableUsd} capacity={r.capacityUsd} />
+                    ) : (
+                      <Amount available={r.available} capacity={r.capacity} decimals={dec} />
+                    )}
+                    {r.inbound && (
+                      <div className="text-gray-500">
+                        in: <Amount available={r.inbound.available} capacity={r.inbound.capacity} decimals={dec} />
+                      </div>
+                    )}
+                    {r.maxTx != null && <div className="text-gray-500">max/tx {fmtAmount(r.maxTx, dec)}</div>}
+                    {r.maxTxUsd != null && <div className="text-gray-500">&gt; {fmtUsd(r.maxTxUsd)}/tx waits 24h</div>}
+                    {r.liquidity != null && <div className="text-gray-500" title="Tokens held by the destination adapter. A lockbox can only release this much; a mint/burn adapter is not limited by it.">dest adapter holds {fmtAmount(r.liquidity, dec)}</div>}
+                    {r.note && <div className="text-gray-500">{r.note}</div>}
+                  </td>
+                  <td className="pr-2 py-1 text-gray-500">{r.refill || r.inbound?.refill || "—"}</td>
+                  <td className="py-1 text-right"><StatusChip status={r.status} /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {rows.length > COLLAPSED_LIMIT_ROWS && (
+            <button type="button" onClick={() => setShowAll((v) => !v)} className="text-[11px] text-gray-500 hover:text-gray-900 mt-1">
+              {showAll ? "Show less" : `Show all ${rows.length} routes`}
+            </button>
+          )}
+        </div>
+      )}
+      {(state.notes || []).map((n) => <p key={n} className="text-[11px] text-gray-500 break-all">{n}</p>)}
+      {state.legend && rows.length > 0 && <p className="text-[10px] text-gray-400">{state.legend}</p>}
+    </div>
+  );
+}
+
 const CONFIDENCE_STYLE = {
   high: "bg-[var(--ink)] text-[var(--on-ink)]",
   medium: "border-[1.5px] border-[var(--warn)] text-[var(--warn)]",
   low: "border-[1.5px] border-[var(--line-2)] text-gray-400",
 };
 
-function FindingCard({ f, chainId, protocol }) {
+function FindingCard({ f, chainId, protocol, limitCtx }) {
   const app = f.appUrl || PROTOCOL_APPS[protocol];
+  const kind = limitCtx ? limitKind(protocol, f) : null;
   return (
     <div className="bg-[var(--surface)] border-[1.5px] border-[var(--line-2)] px-3 py-2.5 flex flex-col gap-2 text-xs">
       <div className="flex items-start justify-between gap-2">
@@ -131,13 +239,15 @@ function FindingCard({ f, chainId, protocol }) {
       <div className="flex flex-wrap gap-1 text-[10px] text-gray-400">
         {f.sources.map((src) => <span key={src} className="border border-dashed border-[var(--line-2)] px-1.5 py-px">{src}</span>)}
       </div>
+
+      {kind && <LimitsPanel kind={kind} f={f} ctx={limitCtx} />}
     </div>
   );
 }
 
 const COLLAPSED_FINDINGS = 3; // e.g. USDC has ~60 Hyperlane routes
 
-function ProtocolCard({ name, r, chainId, index }) {
+function ProtocolCard({ name, r, chainId, index, limitCtx }) {
   const [showLow, setShowLow] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const checking = r.pending > 0;
@@ -145,6 +255,9 @@ function ProtocolCard({ name, r, chainId, index }) {
   const weak = r.findings.filter((f) => f.confidence === "low");
   const detected = strong.length > 0;
   const failedOnly = !checking && !detected && r.errors.length > 0;
+  // A listed NTT token with its manager found: the manager card carries the limits
+  const hasNttManager = r.findings.some((f) => f.confidence !== "low" && /NTT Manager/.test(f.title));
+  const limitsFor = (f) => (hasNttManager && /^Native Token Transfers/.test(f.title) ? null : limitCtx);
 
   return (
     <div className={`tile-inset p-4 mb-4 break-inside-avoid flex flex-col gap-2.5 min-w-0 ${detected ? "scan-hit" : ""}`}>
@@ -171,7 +284,7 @@ function ProtocolCard({ name, r, chainId, index }) {
       </div>
 
       {(showAll ? strong : strong.slice(0, COLLAPSED_FINDINGS)).map((f) => (
-        <FindingCard key={f.address || f.title} f={f} chainId={chainId} protocol={name} />
+        <FindingCard key={f.address || f.title} f={f} chainId={chainId} protocol={name} limitCtx={limitsFor(f)} />
       ))}
       {strong.length > COLLAPSED_FINDINGS && (
         <button
@@ -311,6 +424,10 @@ export default function BridgeScan() {
 
   const detected = scan ? PROTOCOL_KEYS.filter((k) => scan.protocols[k].findings.some((f) => f.confidence !== "low")) : [];
   const meta = scan?.meta;
+  // Limits are read from the contracts once the scan settles (EVM chains only)
+  const limitCtx = meta?.done && scanCtx && scanCtx.chainId !== SOLANA && meta.rpcUrl
+    ? { token: scanCtx.token, chainId: scanCtx.chainId, rpcUrl: meta.rpcUrl, decimals: meta.token?.decimals ?? 18 }
+    : null;
   const split = !!scanCtx; // centred form until the first scan, then form left / results right
 
   const chainIcon = isSolana ? "bg-gradient-to-br from-purple-500 to-emerald-400" : isCustom ? "bg-gray-500" : (ICON_COLORS[chainId] || "bg-gray-400");
@@ -561,7 +678,7 @@ export default function BridgeScan() {
 
                   <div className="xl:columns-2 gap-4 [column-fill:balance]">
                     {PROTOCOL_KEYS.filter((k) => !(k === "Native bridge" && scanCtx?.chainId === SOLANA)).map((k, i) => (
-                      <ProtocolCard key={k} index={i} name={k} r={scan.protocols[k]} chainId={scanCtx?.chainId} />
+                      <ProtocolCard key={k} index={i} name={k} r={scan.protocols[k]} chainId={scanCtx?.chainId} limitCtx={limitCtx} />
                     ))}
                   </div>
                 </>
