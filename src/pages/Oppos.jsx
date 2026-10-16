@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, Check, ChevronRight, Copy, ExternalLink, RefreshCw } from "lucide-react";
 
 // Live OPPOS board from the dexcheck bot (via /api/oppos): a compact list of opportunities (or the
@@ -30,6 +30,7 @@ const ago = (ts) => {
 };
 // "KuCoinFT" → "KuCoin", "HyperliquidFT" → "Hyperliquid"
 const exName = (cex) => (cex || "").replace(/(FT|SP)$/, "").replace(/^Okx$/, "OKX");
+const alertId = (a) => `${a.ts}|${a.title}|${a.symbol}`;
 const rowKey = (r) => `${r.market}|${r.symbol}|${r.cex || r.buy_chain}|${r.contract || r.buy_contract}`;
 
 // Which side is bought and which sold, in the trader's words
@@ -290,14 +291,13 @@ export default function Oppos() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [tab, setTab] = useState("opps");              // "opps" | "alerts"
   const [market, setMarket] = useState("ALL");
   const [onlyActive, setOnlyActive] = useState(true);
   const [onlyVerified, setOnlyVerified] = useState(false);
   const [showBlocked, setShowBlocked] = useState(false);
   const [showLog, setShowLog] = useState(false);
   const [query, setQuery] = useState("");
-  const [selected, setSelected] = useState(null);      // { kind: "row", key } | { kind: "alert", idx }
+  const [selected, setSelected] = useState(null);      // { kind: "row", key } | { kind: "alert", id }
   const [mobileDetail, setMobileDetail] = useState(false);
   const [, tick] = useState(0);
 
@@ -360,12 +360,40 @@ export default function Oppos() {
     return c;
   }, [data]);
 
-  const alerts = useMemo(() => (data?.alerts || []).filter((a) => showLog || a.channel === "main"), [data, showLog]);
+  // Oldest first, newest at the bottom (chat order); the feed sends newest first
+  const alerts = useMemo(
+    () => (data?.alerts || []).filter((a) => showLog || a.channel === "main").slice().reverse(),
+    [data, showLog]);
+
+  // Alerts that arrived while the page is open blink until hovered or clicked
+  const known = useRef(null);
+  const [fresh, setFresh] = useState(() => new Set());
+  useEffect(() => {
+    if (!data) return;
+    const ids = (data.alerts || []).map(alertId);
+    if (known.current === null) { known.current = new Set(ids); return; }
+    const added = ids.filter((id) => !known.current.has(id));
+    if (!added.length) return;
+    added.forEach((id) => known.current.add(id));
+    setFresh((f) => new Set([...f, ...added]));
+  }, [data]);
+  const ack = (id) => setFresh((f) => {
+    if (!f.has(id)) return f;
+    const n = new Set(f);
+    n.delete(id);
+    return n;
+  });
+
+  // Keep the newest alert in view
+  const alertBox = useRef(null);
+  useEffect(() => {
+    if (alertBox.current) alertBox.current.scrollTop = alertBox.current.scrollHeight;
+  }, [alerts.length]);
 
   // Keep the selection on the same opportunity across refreshes; default to the first one
   const current = useMemo(() => {
     if (selected?.kind === "alert") {
-      const a = alerts[selected.idx];
+      const a = alerts.find((x) => alertId(x) === selected.id);
       if (a?.row) return { r: a.row, title: a.title, when: a.ts };
     }
     if (selected?.kind === "row") {
@@ -421,73 +449,77 @@ export default function Oppos() {
         <div className="grid grid-cols-1 lg:grid-cols-[400px_1fr] gap-5 items-start">
           {/* ── List ── */}
           <section className={`tile relative p-4 flex flex-col gap-3 min-w-0 ${mobileDetail ? "hidden lg:flex" : ""}`}>
-            <div className="flex border-b-[1.5px] border-[var(--line-2)] -mx-4 px-4">
-              {[["opps", `Kèo ${counts.ALL}`], ["alerts", `Tin mới ${alerts.length}`]].map(([t, label]) => (
-                <button
-                  key={t}
-                  type="button"
-                  onClick={() => setTab(t)}
-                  className={`px-3 pb-2 text-[12px] font-bold uppercase tracking-wider border-b-[2.5px] -mb-[1.5px] ${
-                    tab === t ? "border-[var(--ink)] text-gray-900" : "border-transparent text-gray-400 hover:text-gray-700"}`}
-                >
-                  {label}
-                </button>
+            <div className="flex items-baseline justify-between">
+              <span className="label">Kèo · {counts.ALL}</span>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {MARKETS.map(([m, label]) => (
+                <Toggle key={m} on={market === m} onChange={() => setMarket(m)}>
+                  {label} <span className="opacity-60">{counts[m]}</span>
+                </Toggle>
               ))}
             </div>
+            <div className="flex flex-wrap gap-1.5 items-center">
+              <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Tìm coin…" className="tile-inset px-2.5 py-1 text-sm w-32" />
+              <Toggle on={onlyActive} onChange={setOnlyActive}>Đang lệch</Toggle>
+              <Toggle on={onlyVerified} onChange={setOnlyVerified}>✓ Có đường</Toggle>
+              <Toggle on={showBlocked} onChange={setShowBlocked}>+ Không đường</Toggle>
+            </div>
+            <div className="flex flex-col gap-2 lg:max-h-[44vh] overflow-y-auto -mr-2 pr-2 pb-1">
+              {rows.map((r) => (
+                <ListItem
+                  key={rowKey(r)}
+                  r={r}
+                  selected={current?.r && !current.title && rowKey(current.r) === rowKey(r)}
+                  onClick={() => pick({ kind: "row", key: rowKey(r) })}
+                />
+              ))}
+              {data && !rows.length && <p className="text-sm text-gray-500 py-8 text-center">Không có kèo nào khớp bộ lọc.</p>}
+              {!data && !error && <p className="text-sm text-gray-500 py-8 text-center">Đang tải…</p>}
+            </div>
 
-            {tab === "opps" ? (
-              <>
-                <div className="flex flex-wrap gap-1.5">
-                  {MARKETS.map(([m, label]) => (
-                    <Toggle key={m} on={market === m} onChange={() => setMarket(m)}>
-                      {label} <span className="opacity-60">{counts[m]}</span>
-                    </Toggle>
-                  ))}
-                </div>
-                <div className="flex flex-wrap gap-1.5 items-center">
-                  <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Tìm coin…" className="tile-inset px-2.5 py-1 text-sm w-32" />
-                  <Toggle on={onlyActive} onChange={setOnlyActive}>Đang lệch</Toggle>
-                  <Toggle on={onlyVerified} onChange={setOnlyVerified}>✓ Có đường</Toggle>
-                  <Toggle on={showBlocked} onChange={setShowBlocked}>+ Không đường</Toggle>
-                </div>
-                <div className="flex flex-col gap-2 lg:max-h-[68vh] overflow-y-auto -mr-2 pr-2 pb-1">
-                  {rows.map((r) => (
-                    <ListItem
-                      key={rowKey(r)}
-                      r={r}
-                      selected={current?.r && !current.title && rowKey(current.r) === rowKey(r)}
-                      onClick={() => pick({ kind: "row", key: rowKey(r) })}
-                    />
-                  ))}
-                  {data && !rows.length && <p className="text-sm text-gray-500 py-8 text-center">Không có kèo nào khớp bộ lọc.</p>}
-                  {!data && !error && <p className="text-sm text-gray-500 py-8 text-center">Đang tải…</p>}
-                </div>
-              </>
-            ) : (
-              <>
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] text-gray-500">Tin bot vừa báo, mới nhất trước</span>
-                  <Toggle on={showLog} onChange={setShowLog}>+ Log</Toggle>
-                </div>
-                <div className="flex flex-col gap-2 lg:max-h-[68vh] overflow-y-auto -mr-2 pr-2 pb-1">
-                  {alerts.map((a, i) => (a.row ? (
-                    <ListItem
-                      key={`${a.ts}-${i}`}
-                      r={a.row}
-                      selected={selected?.kind === "alert" && selected.idx === i}
-                      onClick={() => pick({ kind: "alert", idx: i })}
-                      meta={<>{a.title.slice(0, 48)} · {ago(a.ts)}</>}
-                    />
-                  ) : (
-                    <div key={`${a.ts}-${i}`} className="px-3 py-2.5 border-[1.5px] border-[var(--line-2)] bg-[var(--surface)] text-[12px]">
-                      <div className="flex justify-between gap-2"><b className="text-gray-800">{a.title}</b><span className="text-gray-400">{ago(a.ts)}</span></div>
-                      {a.lines.slice(0, 3).map((ln, j) => <div key={j} className="text-gray-500">{ln}</div>)}
-                    </div>
-                  )))}
-                  {data && !alerts.length && <p className="text-sm text-gray-500 py-8 text-center">Chưa có tin nào.</p>}
-                </div>
-              </>
-            )}
+            {/* ── Recent alerts: oldest on top, newest at the bottom ── */}
+            <div className="flex items-center gap-2 pt-2">
+              <span className="h-[1.5px] flex-1 bg-[var(--line)]" />
+              <span className="label">Tin mới · {alerts.length}</span>
+              {fresh.size > 0 && <Badge tone="up">{fresh.size} chưa xem</Badge>}
+              <span className="h-[1.5px] flex-1 bg-[var(--line)]" />
+              <Toggle on={showLog} onChange={setShowLog}>+ Log</Toggle>
+            </div>
+            <div ref={alertBox} className="flex flex-col divide-y-[1.5px] divide-[var(--line-2)] border-[1.5px] border-[var(--line-2)] lg:max-h-[30vh] overflow-y-auto">
+              {alerts.map((a) => {
+                const id = alertId(a);
+                const isNew = fresh.has(id);
+                const sel = selected?.kind === "alert" && selected.id === id;
+                const r = a.row;
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    onMouseEnter={() => ack(id)}
+                    onFocus={() => ack(id)}
+                    onClick={() => { ack(id); if (r) pick({ kind: "alert", id }); }}
+                    className={`text-left px-3 py-2 text-[12px] flex gap-3 items-start ${isNew ? "alert-new" : "bg-[var(--surface)]"} ${
+                      sel ? "shadow-[inset_3px_0_0_var(--ink)]" : ""} ${r ? "hover:bg-[var(--hover)]" : "cursor-default"} ${a.channel === "main" ? "" : "opacity-70"}`}
+                  >
+                    <span className="text-gray-400 tabular w-8 shrink-0 pt-px">{ago(a.ts)}</span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block font-bold text-gray-800 truncate">{a.title}</span>
+                      {r ? (
+                        <span className="block text-gray-500 truncate">
+                          {r.symbol} <b className={diffTone(r)}>{fmtDiff(r.diff)}</b> · {sides(r).map((x) => x.venue).join(" → ")}
+                          {r.verified ? " · ✓" : ""}
+                        </span>
+                      ) : (
+                        <span className="block text-gray-500 truncate">{a.lines[0] || ""}</span>
+                      )}
+                    </span>
+                    {r && <ChevronRight className="w-4 h-4 text-gray-300 shrink-0 mt-0.5" />}
+                  </button>
+                );
+              })}
+              {data && !alerts.length && <p className="text-[12px] text-gray-500 py-5 text-center">Chưa có tin nào.</p>}
+            </div>
           </section>
 
           {/* ── Detail ── */}
