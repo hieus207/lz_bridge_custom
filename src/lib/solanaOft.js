@@ -291,3 +291,83 @@ export async function sendFromSolana(sol, signer, token, params, onStatus) {
   if (res.value.err) throw Object.assign(new Error(`Transaction failed: ${JSON.stringify(res.value.err)}`), { signature: sig });
   return { signature: sig, nativeFee: quote.nativeFee, amountLd: quote.amountLd };
 }
+
+// ─── Rate limits ─────────────────────────────────────────────────────────────
+
+// Many accounts at once. publicnode refuses batches above ~10 accounts, mainnet-beta takes 100:
+// small batches on the given connection, then the other public RPCs in big batches.
+async function getManyAccounts(connection, keys) {
+  const batches = async (conn, size) => {
+    const out = [];
+    for (let i = 0; i < keys.length; i += size * 4) {
+      const group = [];
+      for (let j = i; j < Math.min(i + size * 4, keys.length); j += size) group.push(keys.slice(j, j + size));
+      out.push(...(await Promise.all(group.map((g) => conn.getMultipleAccountsInfo(g)))).flat());
+    }
+    return out;
+  };
+  try {
+    return await batches(connection, 10);
+  } catch (err) {
+    for (const url of SOLANA_RPCS.filter((u) => u !== connection.rpcEndpoint)) {
+      try { return await batches(new Connection(url, "confirmed"), 100); } catch { /* next */ }
+    }
+    throw err;
+  }
+}
+
+// RateLimiter { capacity, tokens, refill_per_second, last_refill_time } → what can pass now
+const limiterNow = (rl, now) => {
+  if (!rl) return null;
+  const elapsed = BigInt(now) > rl.lastRefillTime ? BigInt(now) - rl.lastRefillTime : 0n;
+  const refilled = rl.tokens + elapsed * rl.refillPerSecond;
+  return { available: refilled > rl.capacity ? rl.capacity : refilled, capacity: rl.capacity, rate: rl.refillPerSecond };
+};
+const someOrNull = (opt) => (opt && opt.__option === "Some" ? opt.value : null);
+
+// First-gen Peer: disc 8 | address [32] | rate_limiter Option<RateLimiter> | …
+function parseLegacyPeer(data) {
+  const out = { peer: "0x" + Buffer.from(data.subarray(8, 40)).toString("hex"), outbound: null, inbound: null };
+  if (data.length >= 73 && data[40] === 1) {
+    out.outbound = {
+      capacity: data.readBigUInt64LE(41), tokens: data.readBigUInt64LE(49),
+      refillPerSecond: data.readBigUInt64LE(57), lastRefillTime: data.readBigUInt64LE(65),
+    };
+  }
+  return out;
+}
+
+// Peers + their outbound/inbound rate limiters for the given EIDs (only existing peers returned).
+// Amounts are in the mint's local decimals.
+export async function getPeerLimits(sol, token, eids) {
+  const now = Math.floor(Date.now() / 1000);
+  const keys = token.legacy
+    ? eids.map((e) => legacyPdas(token.programId, token.oftStore, e).peer)
+    : eids.map((e) => new PublicKey(new OftPDA(umiPk(token.programId)).peer(umiPk(token.oftStore), e)[0].toString()));
+  const infos = await getManyAccounts(sol.connection, keys);
+  const out = [];
+  eids.forEach((eid, i) => {
+    const info = infos[i];
+    if (!info) return;
+    if (token.legacy) {
+      const p = parseLegacyPeer(info.data);
+      out.push({ eid, peer: p.peer, outbound: limiterNow(p.outbound, now), inbound: null });
+      return;
+    }
+    const cfg = oft.accounts.getPeerConfigAccountDataSerializer().deserialize(info.data)[0];
+    out.push({
+      eid,
+      peer: "0x" + Buffer.from(cfg.peerAddress).toString("hex"),
+      outbound: limiterNow(someOrNull(cfg.outboundRateLimiter), now),
+      inbound: limiterNow(someOrNull(cfg.inboundRateLimiter), now),
+    });
+  });
+  return out;
+}
+
+// Tokens held in an adapter's escrow (what it can release on Solana)
+export async function escrowBalance(sol, token) {
+  if (!token.escrow) return null;
+  const info = await sol.connection.getAccountInfo(new PublicKey(token.escrow));
+  return info ? info.data.readBigUInt64LE(64) : null;
+}

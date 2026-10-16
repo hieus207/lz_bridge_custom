@@ -9,7 +9,7 @@
 import { ethers } from "ethers";
 import { CHAINS, CHAIN_LIST, chainName, anyChainName, chainIdFromLzKey, SOLANA } from "./chains";
 import { cached, fetchJson } from "./http";
-import { multicall, ERC20 } from "./onchain";
+import { multicall, ERC20, findNttManager } from "./onchain";
 import { pickWorkingRpc } from "./bridgeScan";
 
 const lc = (s) => (typeof s === "string" ? s.toLowerCase() : "");
@@ -103,6 +103,64 @@ function lzAvailable(rl, now) {
   return { available: limit <= cur ? 0n : limit - cur, capacity: limit, window };
 }
 
+const scaleDec = (x, from, to) => {
+  if (x == null || from == null || to == null || from === to) return x;
+  return to > from ? x * 10n ** BigInt(to - from) : x / 10n ** BigInt(from - to);
+};
+const worse = (a, b) => (STATUS_ORDER[b] > STATUS_ORDER[a] ? b : a);
+const STATUS_ORDER = { unlimited: 0, ok: 1, low: 2, blocked: 3 };
+
+// Receiving side of a lane into `key` (EVM chains we have RPCs for, and Solana):
+// its inbound limiter for `srcEid` and what its adapter holds, in the sender's decimals.
+async function lzDestSide({ key, peer32, srcEid, decimals, now }) {
+  if (key === "solana") {
+    const { makeSolana, resolveSolanaOft, getPeerLimits, escrowBalance } = await import("./solanaOft");
+    const { PublicKey } = await import("@solana/web3.js");
+    const sol = makeSolana(SOLANA_RPC_URLS[0]);
+    const t = await resolveSolanaOft(sol, new PublicKey(ethers.getBytes(peer32)).toBase58());
+    const [peer] = await getPeerLimits(sol, t, [srcEid]);
+    const held = t.oftType === 1 ? await escrowBalance(sol, t).catch(() => null) : null;
+    const inn = peer?.inbound;
+    return {
+      inbound: inn ? { available: scaleDec(inn.available, t.decimals, decimals), capacity: scaleDec(inn.capacity, t.decimals, decimals) } : null,
+      liquidity: held != null ? scaleDec(held, t.decimals, decimals) : null,
+    };
+  }
+  const dstId = chainIdFromLzKey(key);
+  if (!dstId || !CHAINS[dstId]) return null;
+  const dp = await withTimeout(providerFor(dstId), 10000, "rpc");
+  if (!dp) return null;
+  const peerAddr = ethers.getAddress("0x" + peer32.slice(26));
+  const [inRl, inner] = await withTimeout(multicall(dp, [
+    { target: peerAddr, iface: LZ, fn: "inboundRateLimits", args: [srcEid] },
+    { target: peerAddr, iface: LZ, fn: "token" },
+  ]), 10000, "dst");
+  const tokenAddr = inner || peerAddr;
+  const [dDec, bal] = await withTimeout(multicall(dp, [
+    { target: tokenAddr, iface: ERC20, fn: "decimals" },
+    ...(inner && lc(inner) !== lc(peerAddr) ? [{ target: inner, iface: ERC20, fn: "balanceOf", args: [peerAddr] }] : []),
+  ]), 10000, "dst");
+  const dd = dDec != null ? Number(dDec) : decimals;
+  const inLim = lzAvailable(inRl, now);
+  return {
+    inbound: inLim ? { available: scaleDec(inLim.available, dd, decimals), capacity: scaleDec(inLim.capacity, dd, decimals), refill: fmtWindow(inLim.window) } : null,
+    // Informational only: a mint/burn adapter holds nothing yet is not limited by it
+    liquidity: bal != null ? scaleDec(BigInt(bal), dd, decimals) : null,
+  };
+}
+
+async function attachDest(row, args) {
+  try {
+    const d = await withTimeout(lzDestSide(args), 20000, "dst");
+    if (!d) return;
+    if (d.inbound) {
+      row.inbound = d.inbound;
+      row.status = worse(row.status, statusOf(d.inbound.available, d.inbound.capacity, args.decimals));
+    }
+    if (d.liquidity != null) row.liquidity = d.liquidity;
+  } catch { /* destination unreachable: outbound info still stands */ }
+}
+
 async function lzLimits({ address, chainId, provider, decimals, rpcUrl }) {
   const { byKey, byEid } = await loadLzEids();
   const srcKey = CHAINS[chainId]?.lzKey;
@@ -137,33 +195,7 @@ async function lzLimits({ address, chainId, provider, decimals, rpcUrl }) {
     if (maxTx != null && maxTx !== UINT64_MAX && maxTx !== UINT256_MAX) row.maxTx = maxTx;
     row.status = paused === true ? "blocked" : statusOf(row.available, row.capacity, decimals);
     if (paused === true) row.note = "OFT paused";
-
-    // Destination side (chains we have RPCs for): inbound limiter + adapter liquidity
-    const dstId = chainIdFromLzKey(key);
-    if (dstId && CHAINS[dstId]) {
-      try {
-        const dp = await withTimeout(providerFor(dstId), 10000, "rpc");
-        const peerAddr = ethers.getAddress("0x" + r.peer.slice(26));
-        if (dp && srcEid) {
-          const [inRl, inner] = await withTimeout(multicall(dp, [
-            { target: peerAddr, iface: LZ, fn: "inboundRateLimits", args: [srcEid] },
-            { target: peerAddr, iface: LZ, fn: "token" },
-          ]), 10000, "dst");
-          const inLim = lzAvailable(inRl, now);
-          if (inLim) {
-            row.inbound = { available: inLim.available, capacity: inLim.capacity, refill: fmtWindow(inLim.window) };
-            if (statusOf(inLim.available, inLim.capacity) === "blocked") row.status = "blocked";
-            else if (statusOf(inLim.available, inLim.capacity) === "low" && row.status === "ok") row.status = "low";
-          }
-          if (inner && lc(inner) !== lc(peerAddr)) {
-            // Adapter (lockbox) on the destination: it can only release what it holds
-            const [bal] = await withTimeout(multicall(dp, [{ target: inner, iface: ERC20, fn: "balanceOf", args: [peerAddr] }]), 10000, "dst");
-            // Informational only: a mint/burn adapter holds nothing yet is not limited by it
-            if (bal != null) row.liquidity = BigInt(bal);
-          }
-        }
-      } catch { /* destination unreachable: outbound info still stands */ }
-    }
+    if (srcEid) await attachDest(row, { key, peer32: r.peer, srcEid, decimals, now });
     return row;
   }));
 
@@ -175,6 +207,45 @@ async function lzLimits({ address, chainId, provider, decimals, rpcUrl }) {
     if (bal != null) notes.push(`Held by this adapter: ${fmtAmount(BigInt(bal), decimals)} (if it is a lockbox, the most that can be bridged back to ${chainName(chainId)})`);
   }
   return { rows, notes, rpcUrl };
+}
+
+// OFT on Solana: per-peer RateLimiter in the PeerConfig accounts (first-gen programs: outbound only)
+async function lzSolanaLimits({ token }) {
+  const { makeSolana, resolveSolanaOft, getPeerLimits, escrowBalance, SOLANA_EID } = await import("./solanaOft");
+  const { byEid } = await loadLzEids();
+  const sol = makeSolana(SOLANA_RPC_URLS[0]);
+  const t = await resolveSolanaOft(sol, token);
+  const decimals = t.decimals;
+  const peers = await getPeerLimits(sol, t, [...byEid.keys()].filter((e) => e !== SOLANA_EID));
+  if (!peers.length) return { rows: [], notes: ["No peers set on this OFT"] };
+  const now = Math.floor(Date.now() / 1000);
+  const rows = await Promise.all(peers.map(async (p) => {
+    const key = byEid.get(p.eid);
+    const row = { route: `→ ${lzChainLabel(key)}`, dir: "out" };
+    if (p.outbound) {
+      Object.assign(row, {
+        available: p.outbound.available, capacity: p.outbound.capacity,
+        refill: p.outbound.rate ? `+${fmtAmount(p.outbound.rate, decimals)}/s` : null,
+      });
+    }
+    row.status = t.paused ? "blocked" : statusOf(row.available, row.capacity, decimals);
+    if (t.paused) row.note = "OFT paused";
+    await attachDest(row, { key, peer32: p.peer, srcEid: SOLANA_EID, decimals, now });
+    if (p.inbound) {
+      // Solana's own inbound limiter for this peer = cap on arrivals from that chain
+      row.note = [row.note, `receive from ${lzChainLabel(key)}: ${fmtAmount(p.inbound.available, decimals)} / ${fmtAmount(p.inbound.capacity, decimals)}`]
+        .filter(Boolean).join(" · ");
+      row.status = worse(row.status, statusOf(p.inbound.available, p.inbound.capacity, decimals));
+    }
+    return row;
+  }));
+  const notes = [];
+  if (t.legacy) notes.push("First-gen OFT program: only the outbound limiter is stored on Solana");
+  if (t.oftType === 1) {
+    const held = await escrowBalance(sol, t).catch(() => null);
+    if (held != null) notes.push(`Held in the adapter escrow: ${fmtAmount(held, decimals)} (the most that can be bridged back to Solana)`);
+  }
+  return { rows, notes, decimals };
 }
 
 // ─── Chainlink CCIP ──────────────────────────────────────────────────────────
@@ -245,6 +316,7 @@ async function evmPoolBuckets(provider, pool, sel) {
 // Solana pool: per-remote-chain config PDA ["ccip_tokenpool_chainconfig", selector LE, mint].
 // Borsh: disc 8 | pool_addresses Vec<Vec<u8>> | token_address Vec<u8> | decimals u8 |
 //        inbound {tokens u64, last_updated u64, enabled u8, capacity u64, rate u64} | outbound {…}
+const ATA_PROGRAM = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const SOLANA_RPC_URLS = ["https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com"];
 async function solanaConnection() {
   const { Connection } = await import("@solana/web3.js");
@@ -291,9 +363,12 @@ async function solanaPoolBuckets(conn, poolState, mint, sels) {
   const now = Math.floor(Date.now() / 1000);
   // Lock/release liquidity sits in the pool signer's token account
   const [signer] = PublicKey.findProgramAddressSync([new TextEncoder().encode("ccip_tokenpool_signer"), mintKey.toBytes()], program);
-  const held = await conn.getParsedTokenAccountsByOwner(signer, { mint: mintKey })
-    .then((r) => r.value.reduce((s, a) => s + BigInt(a.account.data.parsed.info.tokenAmount.amount), 0n))
-    .catch(() => null);
+  const mintInfo = await conn.getAccountInfo(mintKey);
+  const ata = mintInfo ? PublicKey.findProgramAddressSync(
+    [signer.toBytes(), mintInfo.owner.toBytes(), mintKey.toBytes()], new PublicKey(ATA_PROGRAM)
+  )[0] : null;
+  const ataInfo = ata ? await conn.getAccountInfo(ata) : null;
+  const held = ataInfo ? ataInfo.data.readBigUInt64LE(64) : null;
   return { buckets: accts.map((a) => (a ? decodeSolanaChainConfig(a.data, now) : null)), held };
 }
 
@@ -434,14 +509,11 @@ const untrim = (v, decimals) => {
   return to >= d ? amt * 10n ** BigInt(to - d) : amt / 10n ** BigInt(d - to);
 };
 
-async function nttLimits({ address, token, provider, decimals }) {
+async function nttLimits({ address, token, chainId, provider, decimals }) {
   let manager = address;
   if (!manager) {
-    // Burn-mode NTT tokens point at their manager through minter()
-    const [m] = await multicall(provider, [{ target: token, iface: NTT, fn: "minter" }]);
-    const [mode] = m ? await multicall(provider, [{ target: m, iface: NTT, fn: "getMode" }]) : [null];
-    if (mode == null) return { rows: [], notes: ["NTT manager not found on this chain — limits unknown"] };
-    manager = m;
+    manager = await findNttManager(provider, token, { chainId, blockTime: CHAINS[chainId]?.blockTime });
+    if (!manager) return { rows: [], notes: ["NTT manager not found on this chain — limits unknown"] };
   }
   const whIds = [...new Set([...Object.keys(WH_NAMES).map(Number), ...CHAIN_LIST.filter((c) => c.wormhole).map((c) => c.wormhole.chainId)])];
   const head = await multicall(provider, [
@@ -479,15 +551,31 @@ async function nttLimits({ address, token, provider, decimals }) {
   return { rows, notes: [`NTT manager ${manager}`], legend: "← = how much can arrive here from that chain" };
 }
 
-async function portalLimits({ token, chainId, provider, attestedOn = [] }) {
+const WH_ID_BY_NAME = Object.fromEntries([
+  ...Object.entries(WH_NAMES).map(([id, n]) => [n, Number(id)]),
+  ...CHAIN_LIST.filter((c) => c.wormhole).map((c) => [c.name, c.wormhole.chainId]),
+]);
+
+async function portalLimits({ token, chainId, provider, finding, attestedOn = [] }) {
   const { byChain, governed } = await loadGovernor();
-  const here = CHAINS[chainId]?.wormhole?.chainId;
-  let origin = here ? `${here}:${lc(ethers.zeroPadValue(token, 32))}` : null;
-  const [oc, nc] = await multicall(provider, [
-    { target: token, iface: WRAPPED, fn: "chainId" },
-    { target: token, iface: WRAPPED, fn: "nativeContract" },
-  ]);
-  if (oc != null && nc) origin = `${Number(oc)}:${lc(nc)}`;
+  const isSolana = chainId === SOLANA;
+  const here = isSolana ? 1 : CHAINS[chainId]?.wormhole?.chainId;
+  let origin = null;
+  if (isSolana) {
+    const { PublicKey } = await import("@solana/web3.js");
+    origin = `1:${lc(ethers.hexlify(new PublicKey(token).toBytes()))}`;
+    // Wrapped mint: origin from the Token Bridge meta (shown in the finding)
+    const oName = finding?.details?.find(([k]) => k === "Origin chain")?.[1];
+    const oTok = finding?.details?.find(([k]) => k === "Origin token")?.[1];
+    if (oName && oTok && WH_ID_BY_NAME[oName] != null) origin = `${WH_ID_BY_NAME[oName]}:${lc(ethers.zeroPadValue(oTok, 32))}`;
+  } else {
+    origin = here ? `${here}:${lc(ethers.zeroPadValue(token, 32))}` : null;
+    const [oc, nc] = await multicall(provider, [
+      { target: token, iface: WRAPPED, fn: "chainId" },
+      { target: token, iface: WRAPPED, fn: "nativeContract" },
+    ]);
+    if (oc != null && nc) origin = `${Number(oc)}:${lc(nc)}`;
+  }
   const notes = [];
   if (governed && origin && !governed.has(origin)) {
     notes.push("Token is not on the Governor's priced list → no USD cap applies to it");
@@ -505,7 +593,7 @@ async function portalLimits({ token, chainId, provider, attestedOn = [] }) {
   };
   const rows = [];
   if (here) {
-    const r = chainRow(here, `→ out of ${chainName(chainId)}`);
+    const r = chainRow(here, `→ out of ${isSolana ? "Solana" : chainName(chainId)}`);
     if (r) rows.push(r);
   }
   for (const name of attestedOn) {
@@ -573,6 +661,21 @@ async function hyperlaneLimits({ address, chainId, provider, decimals }) {
   return { rows, notes };
 }
 
+async function hyperlaneSolanaLimits({ address, decimals }) {
+  const { PublicKey } = await import("@solana/web3.js");
+  const conn = await solanaConnection();
+  const program = new PublicKey(address);
+  const [escrow] = PublicKey.findProgramAddressSync(
+    ["hyperlane_token", "-", "escrow"].map((x) => new TextEncoder().encode(x)), program
+  );
+  const info = await conn.getAccountInfo(escrow);
+  const notes = ["Sealevel warp routes have no rate limiter"];
+  if (info && info.data.length >= 72) {
+    notes.push(`Collateral in the escrow: ${fmtAmount(info.data.readBigUInt64LE(64), decimals)} (max that can arrive on Solana)`);
+  }
+  return { rows: [], notes };
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 const PORTAL_TITLES = /Portal|Token Bridge/;
@@ -580,7 +683,13 @@ const PORTAL_TITLES = /Portal|Token Bridge/;
 // Which findings have a limit worth reading (Solana: CCIP pools so far).
 export function limitKind(protocol, f, chainId) {
   if (f.confidence === "low") return null;
-  if (chainId === SOLANA) return protocol === "Chainlink CCIP" && f.address && /pool/i.test(f.title) ? "ccip" : null;
+  if (chainId === SOLANA) {
+    if (protocol === "Chainlink CCIP" && f.address && /pool/i.test(f.title)) return "ccip";
+    if (protocol === "LayerZero" && /OFT/.test(f.title)) return "lz";
+    if (protocol === "Wormhole" && PORTAL_TITLES.test(f.title)) return "portal";
+    if (protocol === "Hyperlane" && f.address) return "hyperlane";
+    return null; // Solana NTT managers: not readable yet
+  }
   if (protocol === "LayerZero" && f.address && /OFT/.test(f.title)) return "lz";
   if (protocol === "Chainlink CCIP" && f.address && /pool/i.test(f.title)) return "ccip";
   if (protocol === "Wormhole" && (/NTT/.test(f.title))) return "ntt";
@@ -590,7 +699,16 @@ export function limitKind(protocol, f, chainId) {
 }
 
 export async function readLimits({ kind, finding, token, chainId, rpcUrl, decimals }) {
-  if (chainId === SOLANA) return ccipLimits({ address: finding.address, token, chainId, decimals, finding });
+  if (chainId === SOLANA) {
+    const args = { address: finding.address, token, chainId, decimals, finding };
+    switch (kind) {
+      case "ccip": return ccipLimits(args);
+      case "lz": return lzSolanaLimits(args);
+      case "portal": return portalLimits({ ...args, attestedOn: finding.destinations || [] });
+      case "hyperlane": return hyperlaneSolanaLimits(args);
+      default: return { rows: [], notes: [] };
+    }
+  }
   const provider = await withTimeout(providerFor(chainId, rpcUrl), 15000, "rpc");
   if (!provider) throw new Error("No RPC reachable");
   const args = { address: finding.address, token, chainId, provider, decimals, rpcUrl, finding };
@@ -603,3 +721,4 @@ export async function readLimits({ kind, finding, token, chainId, rpcUrl, decima
     default: return { rows: [], notes: [] };
   }
 }
+

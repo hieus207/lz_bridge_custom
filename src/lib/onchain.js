@@ -3,6 +3,7 @@
 // for already-deployed contracts — unlike website bundles or private APIs.
 import { ethers } from "ethers";
 import { MULTICALL3 } from "./chains";
+import { fetchJson } from "./http";
 
 const MC_IFACE = new ethers.Interface([
   "function aggregate3((address target, bool allowFailure, bytes callData)[] calls) payable returns ((bool success, bytes returnData)[] returnData)",
@@ -219,4 +220,81 @@ export function classify(address, r, token, { chainId, tokenBridge, holder } = {
   }
 
   return findings;
+}
+
+const NTT_PROBE = new ethers.Interface([
+  "function minter() view returns (address)",
+  "function getMode() view returns (uint8)",
+  "function token() view returns (address)",
+  "function getPeer(uint16) view returns ((bytes32 peerAddress, uint8 tokenDecimals))",
+]);
+const TRANSFER_TOPIC = ethers.id("Transfer(address,address,uint256)");
+const ROUTESCAN_CHAINS = new Set([1, 43114]); // free Etherscan-style API without range limits
+
+// Is any of `addrs` an NTT manager for `token`?
+export async function pickNttManager(provider, addrs, token) {
+  if (!addrs.length) return null;
+  const res = await multicall(provider, addrs.flatMap((a) => [
+    { target: a, iface: NTT_PROBE, fn: "getMode" },
+    { target: a, iface: NTT_PROBE, fn: "token" },
+  ]));
+  return addrs.find((_, i) => res[i * 2] != null && same(res[i * 2 + 1], token)) || null;
+}
+
+// The manager's peer on Wormhole chain `whChainId` (bytes32 → EVM address), if set
+export async function nttPeer(provider, manager, whChainId) {
+  const [p] = await multicall(provider, [{ target: manager, iface: NTT_PROBE, fn: "getPeer", args: [whChainId] }]);
+  const raw = p?.[0] ?? p?.peerAddress;
+  return raw && raw !== ethers.ZeroHash ? ethers.getAddress("0x" + raw.slice(26)) : null;
+}
+
+// Recent mint/burn tx hashes of `token`: Routescan where available, else eth_getLogs going back
+async function mintBurnTxs(provider, token, { chainId, blockTime, days, maxCalls }) {
+  const hashes = [];
+  if (ROUTESCAN_CHAINS.has(Number(chainId))) {
+    try {
+      const url = `https://api.routescan.io/v2/network/mainnet/evm/${chainId}/etherscan/api?module=account&action=tokentx`
+        + `&contractaddress=${token}&address=${ethers.ZeroAddress}&page=1&offset=5&sort=desc`;
+      const json = await fetchJson(url, { timeout: 10000 });
+      for (const t of json.result || []) if (!hashes.includes(t.hash)) hashes.push(t.hash);
+      if (hashes.length) return hashes;
+    } catch { /* fall back to logs */ }
+  }
+  const tip = await provider.getBlockNumber();
+  const oldest = tip - Math.ceil((days * 86400) / blockTime);
+  let to = tip;
+  let span = 50000;
+  for (let i = 0; i < maxCalls && hashes.length < 3 && to > oldest; i++) {
+    const from = Math.max(oldest, to - span);
+    const toBlock = to;
+    try {
+      const ask = (topics) => provider.getLogs({ address: token, topics, fromBlock: from, toBlock });
+      const logs = (await Promise.race([
+        Promise.all([ask([TRANSFER_TOPIC, ethers.ZeroHash]), ask([TRANSFER_TOPIC, null, ethers.ZeroHash])]),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 10000)),
+      ])).flat().sort((a, b) => b.blockNumber - a.blockNumber);
+      for (const l of logs) if (!hashes.includes(l.transactionHash)) hashes.push(l.transactionHash);
+      to = from - 1;
+    } catch {
+      if (span <= 2000) to = from - 1; // still refused at a small range: skip it
+      else span = Math.floor(span / 5); // range too wide for this RPC
+    }
+  }
+  return hashes;
+}
+
+// NTT manager of `token` on this chain: minter() (NttToken standard), else a contract emitting
+// logs in a recent mint/burn tx that is an NTT manager for this token.
+// Lock-mode managers hold the token and are found by the holder scan instead.
+export async function findNttManager(provider, token, { chainId, blockTime = 2, days = 7, maxCalls = 12 } = {}) {
+  const [minter] = await multicall(provider, [{ target: token, iface: NTT_PROBE, fn: "minter" }]);
+  if (addr(minter) && (await pickNttManager(provider, [minter], token))) return minter;
+  const hashes = await mintBurnTxs(provider, token, { chainId, blockTime, days, maxCalls });
+  for (const h of hashes.slice(0, 3)) {
+    const rc = await provider.getTransactionReceipt(h).catch(() => null);
+    const cands = [...new Set((rc?.logs || []).map((l) => l.address).filter((a) => !same(a, token)))];
+    const hit = await pickNttManager(provider, cands, token);
+    if (hit) return hit;
+  }
+  return null;
 }

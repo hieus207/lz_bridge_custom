@@ -9,7 +9,7 @@ import {
   CHAINS, CHAIN_LIST, getRpcs, chainName, chainIdFromLzKey, chainIdFromWormholeId, anyChainName, SOLANA,
 } from "./chains";
 import { cached, fetchJson, fetchWithTimeout } from "./http";
-import { makeProvider, multicall, probeContracts, classify, ERC20 } from "./onchain";
+import { makeProvider, multicall, probeContracts, classify, ERC20, findNttManager, pickNttManager, nttPeer } from "./onchain";
 import { discoverHolders } from "./holders";
 import { nativeBridgeChecks } from "./nativeBridges";
 
@@ -245,6 +245,62 @@ export async function wormholeAttestations(originWh, token32, excludeChainId) {
   return checks.filter(Boolean);
 }
 
+// WormholeScan lists NTT tokens by CoinGecko addresses too (ezETH on BNB/L2s is another bridge):
+// the listing stands only once an NTT manager for this exact token is found on-chain.
+const isListed = (f, type) =>
+  f.sources.length === 1 && f.sources[0] === "WormholeScan" && f.details.some(([k, v]) => k === "Type" && v === type);
+// The manager on this chain; failing that, a manager found on another chain of the listing tells
+// us ours (same address — usual for deterministic deploys — or its getPeer for this chain).
+async function locateNttManager({ token, chain, provider }) {
+  const here = await findNttManager(provider, token, { chainId: chain?.id, blockTime: chain?.blockTime }).catch(() => null);
+  if (here || !chain?.wormhole) return here;
+  const listing = (await loadWormholeScan().catch(() => []))
+    .find((t) => t.type === "NATIVE_TOKEN_TRANSFER" && lc(t.platforms?.[chain.cgPlatform]) === lc(token));
+  const others = CHAIN_LIST.filter((c) => c.id !== chain.id && c.wormhole && listing?.platforms?.[c.cgPlatform]?.startsWith?.("0x"));
+  const found = await Promise.all(others.slice(0, 5).map(async (c) => {
+    try {
+      const picked = await pickWorkingRpc(c.id);
+      if (!picked) return null;
+      const t = ethers.getAddress(listing.platforms[c.cgPlatform]);
+      const m = await withTimeout(findNttManager(picked.provider, t, { chainId: c.id, blockTime: c.blockTime, maxCalls: 6 }), 25000, c.name);
+      return m ? { provider: picked.provider, manager: m } : null;
+    } catch { return null; }
+  }));
+  for (const f of found.filter(Boolean)) {
+    if (await pickNttManager(provider, [f.manager], token)) return f.manager;
+    const peer = await nttPeer(f.provider, f.manager, chain.wormhole.chainId).catch(() => null);
+    if (peer && (await pickNttManager(provider, [peer], token))) return peer;
+  }
+  return null;
+}
+
+async function verifyNtt(state, { token, chain, provider, setMeta }) {
+  const wh = state.protocols.Wormhole;
+  const listed = wh.findings.filter((f) => isListed(f, "NATIVE_TOKEN_TRANSFER"));
+  if (!listed.length || wh.findings.some((f) => f.confidence === "high" && /NTT Manager/.test(f.title))) return;
+  setMeta({ progress: "Looking for the NTT manager on-chain…" });
+  const manager = await withTimeout(locateNttManager({ token, chain, provider }), 60000, "NTT").catch(() => null);
+  if (manager) {
+    mergeFinding(wh.findings, {
+      protocol: "Wormhole", title: "NTT Manager", address: manager, confidence: "high",
+      source: "on-chain (NTT manager lookup)", details: [["token()", token]],
+    });
+    return;
+  }
+  wh.findings = wh.findings.filter((f) => !listed.includes(f));
+  wh.findings.push({
+    protocol: "Wormhole",
+    title: "No NTT manager found (WormholeScan listing only)",
+    confidence: "low",
+    sources: ["WormholeScan"],
+    details: [
+      ["Symbol", listed[0].details.find(([k]) => k === "Symbol")?.[1] || "?"],
+      ["Why", "No NTT manager for this token found on-chain (here or via the other listed chains) — the listing uses CoinGecko addresses, this chain may use another bridge"],
+    ],
+    destinations: [],
+  });
+}
+
 // WormholeScan's "secured tokens" are keyed by CoinGecko id, so a token listed there as
 // PORTAL_TOKEN_BRIDGE often has no wrapped pair at all — Portal's UI then routes it through
 // Mayan Swift, a cross-chain swap, not a 1:1 bridge. Portal counts only with on-chain proof
@@ -252,8 +308,7 @@ export async function wormholeAttestations(originWh, token32, excludeChainId) {
 const PORTAL_PROOF = /Wormhole-wrapped token|attested on Portal|Locked in Wormhole Token Bridge/;
 export function finalizeWormhole(state, { verified }) {
   const wh = state.protocols.Wormhole;
-  const listedPortal = wh.findings.filter((f) =>
-    f.sources.length === 1 && f.sources[0] === "WormholeScan" && f.details.some(([k, v]) => k === "Type" && v === "PORTAL_TOKEN_BRIDGE"));
+  const listedPortal = wh.findings.filter((f) => isListed(f, "PORTAL_TOKEN_BRIDGE"));
   if (!listedPortal.length) return;
   wh.findings = wh.findings.filter((f) => !listedPortal.includes(f));
   if (wh.findings.some((f) => f.confidence !== "low" && PORTAL_PROOF.test(f.title))) return; // proven on-chain
@@ -486,6 +541,7 @@ export async function scanToken({ token, chainId, rpcUrl, proxyBase, onState }) 
   }
 
   await Promise.all(tasks);
+  if (provider) await verifyNtt(state, { token, chain, provider, setMeta });
   finalizeWormhole(state, { verified: !!(provider && chain?.wormhole) });
   setMeta({ progress: null, done: true });
   return state;
