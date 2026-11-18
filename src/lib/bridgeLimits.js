@@ -3,7 +3,8 @@
 // (and the Wormhole Governor API). Each protocol caps transfers differently:
 //   LayerZero  OFT RateLimiter (getAmountCanBeSent / rateLimits / outbound+inboundRateLimits),
 //              quoteOFT max per tx, and the liquidity locked in an adapter (lockbox)
-//   CCIP       token pool rate limiter per remote chain (outbound + inbound), lock/release liquidity
+//   CCIP       token pool rate limiter per remote chain (outbound + inbound), and what a lock/release
+//              pool holds, which caps arrivals even with the rate limiter off
 //   Wormhole   NTT manager outbound / per-chain inbound capacity; Portal → Governor USD cap per chain
 //   Hyperlane  RateLimited router / hook / ISM, collateral liquidity
 import { ethers } from "ethers";
@@ -11,6 +12,7 @@ import { CHAINS, CHAIN_LIST, chainName, anyChainName, chainIdFromLzKey, SOLANA }
 import { cached, fetchJson } from "./http";
 import { multicall, ERC20, findNttManager } from "./onchain";
 import { pickWorkingRpc } from "./bridgeScan";
+import { safeSimulateCredit, solanaMintAuthorityCheck, solanaEscrowCheck } from "./deliveryCheck";
 
 const lc = (s) => (typeof s === "string" ? s.toLowerCase() : "");
 const ZERO32 = ethers.ZeroHash;
@@ -51,7 +53,7 @@ export const fmtWindow = (sec) => {
   return `per ${s}s`;
 };
 
-// ok | low (<10% left) | blocked (nothing can pass) | unlimited
+// ok | low (<10% left) | blocked (nothing can pass) | unknown (a side could not be read) | unlimited
 // A capacity below 0.0001 token is a lane switched off by setting a dust limit.
 function statusOf(available, capacity, decimals) {
   if (capacity == null) return "unlimited";
@@ -91,6 +93,7 @@ const LZ = new ethers.Interface([
   "function quoteOFT((uint32 dstEid, bytes32 to, uint256 amountLD, uint256 minAmountLD, bytes extraOptions, bytes composeMsg, bytes oftCmd)) view returns ((uint256 minAmountLD, uint256 maxAmountLD), (int256 feeAmountLD, string description)[], (uint256 amountSentLD, uint256 amountReceivedLD))",
   "function paused() view returns (bool)",
   "function token() view returns (address)",
+  "function approvalRequired() view returns (bool)",
 ]);
 
 // LayerZero RateLimiter: in-flight amount decays linearly over the window.
@@ -108,22 +111,29 @@ const scaleDec = (x, from, to) => {
   return to > from ? x * 10n ** BigInt(to - from) : x / 10n ** BigInt(from - to);
 };
 const worse = (a, b) => (STATUS_ORDER[b] > STATUS_ORDER[a] ? b : a);
-const STATUS_ORDER = { unlimited: 0, ok: 1, low: 2, blocked: 3 };
+const STATUS_ORDER = { unlimited: 0, ok: 1, unknown: 2, low: 3, blocked: 4 };
 
 // Receiving side of a lane into `key` (EVM chains we have RPCs for, and Solana):
-// its inbound limiter for `srcEid` and what its adapter holds, in the sender's decimals.
-async function lzDestSide({ key, peer32, srcEid, decimals, now }) {
+// its inbound limiter for `srcEid`, what its adapter holds, and whether it can credit an arrival
+// (`amount` in the sender's decimals; default = 1 token), all in the sender's decimals.
+async function lzDestSide({ key, peer32, srcEid, decimals, now, amount, recipient }) {
   if (key === "solana") {
     const { makeSolana, resolveSolanaOft, getPeerLimits, escrowBalance } = await import("./solanaOft");
     const { PublicKey } = await import("@solana/web3.js");
     const sol = makeSolana(SOLANA_RPC_URLS[0]);
     const t = await resolveSolanaOft(sol, new PublicKey(ethers.getBytes(peer32)).toBase58());
-    const [peer] = await getPeerLimits(sol, t, [srcEid]);
+    const [peer] = srcEid ? await getPeerLimits(sol, t, [srcEid]) : [null];
     const held = t.oftType === 1 ? await escrowBalance(sol, t).catch(() => null) : null;
     const inn = peer?.inbound;
+    let delivery;
+    if (t.paused) delivery = { status: "blocked", note: "OFT program paused" };
+    else if (t.oftType === 1) delivery = solanaEscrowCheck(held, amount != null ? scaleDec(amount, decimals, t.decimals) : null);
+    else delivery = await solanaMintAuthorityCheck(sol.connection, t.mint, t.oftStore).catch((e) => ({ status: "unknown", note: e.message }));
     return {
+      chain: "Solana",
       inbound: inn ? { available: scaleDec(inn.available, t.decimals, decimals), capacity: scaleDec(inn.capacity, t.decimals, decimals) } : null,
       liquidity: held != null ? scaleDec(held, t.decimals, decimals) : null,
+      delivery,
     };
   }
   const dstId = chainIdFromLzKey(key);
@@ -131,34 +141,90 @@ async function lzDestSide({ key, peer32, srcEid, decimals, now }) {
   const dp = await withTimeout(providerFor(dstId), 10000, "rpc");
   if (!dp) return null;
   const peerAddr = ethers.getAddress("0x" + peer32.slice(26));
-  const [inRl, inner] = await withTimeout(multicall(dp, [
-    { target: peerAddr, iface: LZ, fn: "inboundRateLimits", args: [srcEid] },
+  const [inRl, inner, approval, paused] = await withTimeout(multicall(dp, [
+    { target: peerAddr, iface: LZ, fn: "inboundRateLimits", args: [srcEid || 0] },
     { target: peerAddr, iface: LZ, fn: "token" },
+    { target: peerAddr, iface: LZ, fn: "approvalRequired" },
+    { target: peerAddr, iface: LZ, fn: "paused" },
   ]), 10000, "dst");
   const tokenAddr = inner || peerAddr;
+  const external = !!inner && lc(inner) !== lc(peerAddr);
   const [dDec, bal] = await withTimeout(multicall(dp, [
     { target: tokenAddr, iface: ERC20, fn: "decimals" },
-    ...(inner && lc(inner) !== lc(peerAddr) ? [{ target: inner, iface: ERC20, fn: "balanceOf", args: [peerAddr] }] : []),
+    ...(external ? [{ target: inner, iface: ERC20, fn: "balanceOf", args: [peerAddr] }] : []),
   ]), 10000, "dst");
   const dd = dDec != null ? Number(dDec) : decimals;
-  const inLim = lzAvailable(inRl, now);
+  const inLim = srcEid ? lzAvailable(inRl, now) : null;
+  // The credit the destination OFT performs on arrival, simulated from its own address
+  let delivery;
+  if (paused === true) delivery = { status: "blocked", note: "destination OFT paused" };
+  else if (!external) delivery = { status: "ok", mode: "internal", note: "token is the OFT itself: it mints internally" };
+  else {
+    const probe = amount != null ? scaleDec(amount, decimals, dd) : 10n ** BigInt(dd);
+    delivery = await withTimeout(safeSimulateCredit(dp, {
+      token: inner, spender: peerAddr, recipient, amount: probe, mode: approval === true ? "release" : "auto",
+    }), 15000, "sim").catch((e) => ({ status: "unknown", note: e.message }));
+  }
   return {
+    chain: chainName(dstId),
     inbound: inLim ? { available: scaleDec(inLim.available, dd, decimals), capacity: scaleDec(inLim.capacity, dd, decimals), refill: fmtWindow(inLim.window) } : null,
     // Informational only: a mint/burn adapter holds nothing yet is not limited by it
     liquidity: bal != null ? scaleDec(BigInt(bal), dd, decimals) : null,
+    delivery,
   };
 }
 
 async function attachDest(row, args) {
   try {
-    const d = await withTimeout(lzDestSide(args), 20000, "dst");
+    const d = await withTimeout(lzDestSide(args), 30000, "dst");
     if (!d) return;
     if (d.inbound) {
       row.inbound = d.inbound;
       row.status = worse(row.status, statusOf(d.inbound.available, d.inbound.capacity, args.decimals));
     }
     if (d.liquidity != null) row.liquidity = d.liquidity;
+    if (d.delivery) {
+      row.delivery = { ...d.delivery, chain: d.chain };
+      row.status = worse(row.status, d.delivery.status === "ok" ? "ok" : d.delivery.status);
+    }
   } catch { /* destination unreachable: outbound info still stands */ }
+}
+
+// Pre-flight for one transfer: can `amount` (source decimals) arrive on `dstEid` through this OFT?
+// Resolves the peer on the source OFT, then reads/simulates the destination side.
+export async function checkLzDelivery({ provider, oft, srcChainId, dstEid, amount, recipient, decimals }) {
+  const { byKey, byEid } = await loadLzEids();
+  const key = byEid.get(Number(dstEid));
+  if (!key) return { status: "unknown", chain: `eid ${dstEid}`, note: "destination eid not in LayerZero's registry" };
+  const [peer32] = await multicall(provider, [{ target: oft, iface: LZ, fn: "peers", args: [dstEid] }]);
+  if (!peer32 || peer32 === ZERO32) return { status: "blocked", chain: lzChainLabel(key), note: "this OFT has no peer on that chain" };
+  const srcEid = CHAINS[srcChainId]?.lzKey ? byKey.get(CHAINS[srcChainId].lzKey) : null;
+  return destVerdict(await withTimeout(lzDestSide({
+    key, peer32, srcEid, decimals, now: Math.floor(Date.now() / 1000), amount, recipient,
+  }), 30000, "dst"), key, amount, decimals);
+}
+
+// Same, sending from Solana (peer address comes from the OFT's PeerConfig account)
+export async function checkLzDeliveryFromSolana({ sol, token, dstEid, amount, recipient }) {
+  const { getPeerLimits, SOLANA_EID } = await import("./solanaOft");
+  const { byEid } = await loadLzEids();
+  const key = byEid.get(Number(dstEid));
+  const [p] = await getPeerLimits(sol, token, [dstEid]);
+  if (!p?.peer || p.peer === ZERO32) return { status: "blocked", chain: lzChainLabel(key), note: "this OFT has no peer on that chain" };
+  return destVerdict(await withTimeout(lzDestSide({
+    key, peer32: p.peer, srcEid: SOLANA_EID, decimals: token.decimals, now: Math.floor(Date.now() / 1000), amount, recipient,
+  }), 30000, "dst"), key, amount, token.decimals);
+}
+
+function destVerdict(d, key, amount, decimals) {
+  const chain = lzChainLabel(key);
+  if (!d) return { status: "unknown", chain, note: `no RPC for ${chain} here: destination not checked` };
+  const out = { ...(d.delivery || { status: "unknown", note: "not simulated" }), chain, inbound: d.inbound, liquidity: d.liquidity };
+  if (out.status !== "blocked" && d.inbound?.capacity != null && amount != null && BigInt(amount) > d.inbound.available) {
+    out.status = "blocked";
+    out.note = `${chain} inbound rate limit: only ${fmtAmount(d.inbound.available, decimals)} can arrive right now`;
+  }
+  return out;
 }
 
 async function lzLimits({ address, chainId, provider, decimals, rpcUrl }) {
@@ -282,6 +348,10 @@ const CCIP = new ethers.Interface([
   `function getCurrentOutboundRateLimiterState(uint64) view returns (${BUCKET})`,
   `function getCurrentInboundRateLimiterState(uint64) view returns (${BUCKET})`,
   `function getCurrentRateLimiterState(uint64, bool) view returns (${BUCKET}, ${BUCKET})`,
+  "function getAvailableTokens(uint64) view returns (uint256)",
+  "function getLockBox() view returns (address)",
+  "function getLockBox(uint64) view returns (address)",
+  "function getPreviousPool() view returns (address)",
 ]);
 
 // { available, capacity, rate } in the pool's own decimals; capacity null = limiter off
@@ -311,6 +381,49 @@ async function evmPoolBuckets(provider, pool, sel) {
     { target: pool, iface: CCIP, fn: "getCurrentRateLimiterState", args: [sel, false] },
   ]);
   return { out: bucket(o1 ?? v2?.[0]), in: bucket(i1 ?? v2?.[1]) };
+}
+
+const isLockRelease = (name) => /^(Siloed)?LockRelease/i.test(name || "");
+// Pools that mint on arrival through the token's own minter interface (USDC pools go through CCTP)
+const isMintPool = (name) => /Burn.*Mint|BurnMint/i.test(name || "") && !/USDC|CCTP/i.test(name || "");
+
+// Solana burn/mint pool: the mint authority must be the pool's signer PDA (or a multisig with it)
+async function solanaPoolMintCheck(conn, poolState, mint) {
+  const { PublicKey } = await import("@solana/web3.js");
+  const info = await conn.getAccountInfo(new PublicKey(poolState));
+  if (!info) return { status: "unknown", note: "pool account not found" };
+  const [signer] = PublicKey.findProgramAddressSync(
+    [new TextEncoder().encode("ccip_tokenpool_signer"), new PublicKey(mint).toBytes()], info.owner,
+  );
+  return solanaMintAuthorityCheck(conn, mint, signer.toBase58());
+}
+
+// What a lock/release pool can pay to a lane. Tokens sit in a v2 lockbox, a siloed lane's own
+// balance, or the pool itself (plus the previous pool behind a 1.5 proxy).
+async function evmPoolHeld(provider, pool, token, sel) {
+  const [silo, box, siloBox, prev] = await multicall(provider, [
+    { target: pool, iface: CCIP, fn: "getAvailableTokens", args: [sel] },
+    { target: pool, iface: CCIP, fn: "getLockBox()" },
+    { target: pool, iface: CCIP, fn: "getLockBox(uint64)", args: [sel] },
+    { target: pool, iface: CCIP, fn: "getPreviousPool" },
+  ]);
+  const real = (a) => (a && a !== ethers.ZeroAddress ? a : null);
+  const lockbox = real(siloBox) || real(box);
+  if (!lockbox && silo != null) return BigInt(silo);
+  const holders = lockbox ? [lockbox] : [pool, real(prev)].filter(Boolean);
+  const bals = await multicall(provider, holders.map((h) => ({ target: token, iface: ERC20, fn: "balanceOf", args: [h] })));
+  return bals.some((b) => b == null) ? null : bals.reduce((sum, b) => sum + BigInt(b), 0n);
+}
+
+// Share of what could be sent that the receiving pool can pay out. A burn/mint source can never
+// out-send its backing, so a tiny pool is fine there; a lock/release source can, and then the
+// message reverts on arrival after the tokens are already locked.
+function liquidityStatus(held, sendable, decimals) {
+  if (sendable != null && sendable <= held) return "ok";
+  if (held === 0n || (decimals != null && held < 10n ** BigInt(Math.max(decimals - 4, 0)))) return "blocked";
+  if (sendable == null) return "ok";
+  if (held * 100000n < sendable) return "blocked"; // < 0.001%
+  return held * 1000n < sendable ? "low" : "ok"; // < 0.1%
 }
 
 // Solana pool: per-remote-chain config PDA ["ccip_tokenpool_chainconfig", selector LE, mint].
@@ -369,7 +482,8 @@ async function solanaPoolBuckets(conn, poolState, mint, sels) {
   )[0] : null;
   const ataInfo = ata ? await conn.getAccountInfo(ata) : null;
   const held = ataInfo ? ataInfo.data.readBigUInt64LE(64) : null;
-  return { buckets: accts.map((a) => (a ? decodeSolanaChainConfig(a.data, now) : null)), held };
+  const supply = mintInfo ? mintInfo.data.readBigUInt64LE(36) : null;
+  return { buckets: accts.map((a) => (a ? decodeSolanaChainConfig(a.data, now) : null)), held, supply };
 }
 
 async function ccipLimits({ address, chainId, token, provider, decimals, finding }) {
@@ -389,14 +503,19 @@ async function ccipLimits({ address, chainId, token, provider, decimals, finding
   let sels;
   let local;
   let tv = null;
+  let localHeld = [];
+  let localSupply = null;
+  let recvDelivery = null; // can THIS pool credit an arrival (mint simulated from the pool)
   if (isSolana) {
     sels = (self?.destinations || []).map((d) => selByChain.get(String(d))).filter(Boolean);
     if (!sels.length) return { rows: [], notes: ["Remote chains unknown (token not in the CCIP directory)"] };
     const conn = await solanaConnection();
-    const { buckets, held } = await solanaPoolBuckets(conn, address, token, sels);
+    const { buckets, held, supply } = await solanaPoolBuckets(conn, address, token, sels);
     local = buckets;
-    tv = finding?.title?.match(/\((.+)\)/)?.[1] || null;
-    if (/LockRelease/i.test(tv || "") && held != null) notes.push(`Liquidity in this lock/release pool: ${fmtAmount(held, decimals)} (max that can arrive on Solana)`);
+    tv = self?.pool?.rawType || finding?.title?.match(/\((.+)\)/)?.[1] || null;
+    localHeld = sels.map(() => held);
+    localSupply = supply;
+    if (isMintPool(tv)) recvDelivery = await solanaPoolMintCheck(conn, address, token).catch((e) => ({ status: "unknown", note: e.message }));
   } else {
     const [v, poolToken, s] = await multicall(provider, [
       { target: address, iface: CCIP, fn: "typeAndVersion" },
@@ -407,35 +526,75 @@ async function ccipLimits({ address, chainId, token, provider, decimals, finding
     sels = (s || []).map((x) => BigInt(x));
     if (!sels.length) return { rows: [], notes: ["Pool has no remote chains configured"] };
     local = await Promise.all(sels.map((sel) => evmPoolBuckets(provider, address, sel)));
-    if (/LockRelease/i.test(tv || "") && poolToken) {
-      const [bal] = await multicall(provider, [{ target: poolToken, iface: ERC20, fn: "balanceOf", args: [address] }]);
-      if (bal != null) notes.push(`Liquidity in this lock/release pool: ${fmtAmount(BigInt(bal), decimals)} (max that can arrive on ${chainName(chainId)})`);
+    if (poolToken) {
+      if (isLockRelease(tv)) localHeld = await Promise.all(sels.map((sel) => evmPoolHeld(provider, address, poolToken, sel).catch(() => null)));
+      const [supply] = await multicall(provider, [{ target: poolToken, iface: ERC20, fn: "totalSupply" }]);
+      if (supply != null) localSupply = BigInt(supply);
+      if (isMintPool(tv)) {
+        recvDelivery = await safeSimulateCredit(provider, { token: poolToken, spender: address, amount: 10n ** BigInt(decimals ?? 18), mode: "mint" });
+      }
     }
   }
   if (tv) notes.unshift(tv);
+  const hereName = isSolana ? "Solana" : chainName(chainId);
+  if (recvDelivery) recvDelivery = { ...recvDelivery, chain: hereName };
 
   // Remote pools (from the directory) for the other half of each lane
   const remoteBySel = new Map();
+  const lockReleaseBySel = new Map();
   if (self && hereSel != null) {
     await Promise.all(Object.entries(directory).map(async ([key, e]) => {
       if (key === here || !e.pool?.address) return;
       const sel = selByChain.get(key);
       if (sel == null || !sels.includes(sel)) return;
+      lockReleaseBySel.set(sel, isLockRelease(e.pool.rawType));
+      const remoteName = nameBySel.get(String(sel)) || `selector ${sel}`;
       try {
         let b = null;
+        let held = null;
+        let supply = null;
+        let delivery = null; // can the remote pool mint what we send it
         if (key === CCIP_SOLANA) {
           const conn = await solanaConnection();
-          b = (await solanaPoolBuckets(conn, e.pool.address, e.tokenAddress, [hereSel])).buckets[0];
+          const r = await solanaPoolBuckets(conn, e.pool.address, e.tokenAddress, [hereSel]);
+          b = r.buckets[0];
+          held = r.held;
+          supply = r.supply;
+          if (isMintPool(e.pool.rawType)) delivery = await solanaPoolMintCheck(conn, e.pool.address, e.tokenAddress).catch((err) => ({ status: "unknown", note: err.message }));
         } else if (CHAINS[key]) {
           const p = await withTimeout(providerFor(Number(key)), 10000, "rpc");
-          if (p) b = await withTimeout(evmPoolBuckets(p, e.pool.address, hereSel), 10000, "pool");
+          if (p) {
+            b = await withTimeout(evmPoolBuckets(p, e.pool.address, hereSel), 10000, "pool");
+            if (lockReleaseBySel.get(sel)) held = await withTimeout(evmPoolHeld(p, e.pool.address, e.tokenAddress, hereSel), 10000, "pool").catch(() => null);
+            const [s] = await withTimeout(multicall(p, [{ target: e.tokenAddress, iface: ERC20, fn: "totalSupply" }]), 10000, "pool").catch(() => [null]);
+            if (s != null) supply = BigInt(s);
+            if (isMintPool(e.pool.rawType)) {
+              delivery = await withTimeout(safeSimulateCredit(p, {
+                token: e.tokenAddress, spender: e.pool.address, amount: 10n ** BigInt(e.decimals ?? decimals ?? 18), mode: "mint",
+              }), 15000, "sim").catch((err) => ({ status: "unknown", note: err.message }));
+            }
+          }
         }
-        if (b) remoteBySel.set(sel, { out: rescale(b.out, e.decimals, decimals), in: rescale(b.in, e.decimals, decimals) });
+        if (b) remoteBySel.set(sel, {
+          out: rescale(b.out, e.decimals, decimals),
+          in: rescale(b.in, e.decimals, decimals),
+          held: scaleDec(held, e.decimals, decimals),
+          supply: scaleDec(supply, e.decimals, decimals),
+          delivery: delivery ? { ...delivery, chain: remoteName } : null,
+        });
       } catch { /* remote side unreadable: show this pool only */ }
     }));
   }
 
   const refill = (b) => (b?.rate && b.capacity ? `+${fmtAmount(b.rate, decimals)}/s (full in ${fmtDuration(b.capacity / b.rate)})` : null);
+  // The receiving side of a lane when its pool pays out of what it holds
+  const payout = (lockRelease, chain, held, srcSupply, srcHeld, cap) => {
+    if (!lockRelease) return null;
+    if (held == null) return { chain, held: null, status: "unknown" };
+    if (cap != null && held >= cap) return { chain, held, status: "ok" }; // no single transfer can outgrow the pool
+    const free = srcSupply != null && srcHeld != null && srcSupply > srcHeld ? srcSupply - srcHeld : srcSupply;
+    return { chain, held, status: liquidityStatus(held, free, decimals) };
+  };
   const rows = sels.map((sel, i) => {
     const mine = local[i] || {};
     const remote = remoteBySel.get(sel);
@@ -445,16 +604,28 @@ async function ccipLimits({ address, chainId, token, provider, decimals, finding
     const row = { route: `⇄ ${name}`, dir: "both" };
     if (out) Object.assign(row, { available: out.available, capacity: out.capacity, refill: refill(out) });
     if (inn) row.inbound = { available: inn.available, capacity: inn.capacity, refill: refill(inn) };
+    const sendPool = payout(lockReleaseBySel.get(sel), name, remote?.held, localSupply, localHeld[i], out?.capacity);
+    const recvPool = payout(isLockRelease(tv), hereName, localHeld[i], remote?.supply, remote?.held, inn?.capacity);
+    if (sendPool) row.sendPool = sendPool;
+    if (recvPool) {
+      row.recvPool = recvPool;
+      row.inbound = row.inbound || { capacity: null };
+    }
+    if (remote?.delivery) row.delivery = remote.delivery;
+    if (recvDelivery) row.recvDelivery = recvDelivery;
     const by = [];
     if (remote && out && out === remote.in && out.capacity != null) by.push(`send capped by ${name} pool`);
     if (remote && inn && inn === remote.out && inn.capacity != null) by.push(`receive capped by ${name} pool`);
     if (by.length) row.note = by.join(" · ");
     if (!remote) row.note = `${name} side not checked`;
-    const st = [statusOf(row.available, row.capacity, decimals), statusOf(inn?.available, inn?.capacity, decimals)];
-    row.status = st.includes("blocked") ? "blocked" : st.includes("low") ? "low" : st.every((x) => x === "unlimited") ? "unlimited" : "ok";
+    const st = [statusOf(row.available, row.capacity, decimals), statusOf(inn?.available, inn?.capacity, decimals), sendPool?.status, recvPool?.status,
+      row.delivery?.status === "ok" ? null : row.delivery?.status, recvDelivery?.status === "ok" ? null : recvDelivery?.status];
+    if (sendPool?.held != null || recvPool?.held != null) st.push("ok"); // capped by what it holds, so never "no limit"
+    row.status = st.filter(Boolean).reduce(worse);
+    if (!remote && row.status === "unlimited") row.status = "unknown";
     return row;
   });
-  return { rows, notes, legend: "Top = can send to that chain now · in = can receive from it (tighter of both pools)" };
+  return { rows, notes, legend: "Top = can send to that chain now · in = can receive from it (tighter of both pools; a lock/release pool can only pay out what it holds)" };
 }
 
 const fmtDuration = (secBig) => {
@@ -548,8 +719,37 @@ async function nttLimits({ address, token, chainId, provider, decimals }) {
       status: limit ? statusOf(BigInt(cap ?? 0), limit) : "unlimited",
     });
   });
-  return { rows, notes: [`NTT manager ${manager}`], legend: "← = how much can arrive here from that chain" };
+  // Outbound: can the peer manager on each EVM chain we can reach credit an arrival?
+  await Promise.all(peers.map(async (id, i) => {
+    const dstId = CHAIN_LIST.find((c) => c.wormhole?.chainId === id)?.id;
+    const peerRaw = head[3 + whIds.indexOf(id)];
+    if (!dstId || !peerRaw) return;
+    const peerAddr = ethers.getAddress("0x" + (peerRaw[0] ?? peerRaw.peerAddress).slice(26));
+    const row = { route: `→ ${whName(id)}`, dir: "out", status: "unknown" };
+    try {
+      const dp = await withTimeout(providerFor(dstId), 10000, "rpc");
+      if (!dp) return;
+      const [mode, dToken] = await withTimeout(multicall(dp, [
+        { target: peerAddr, iface: NTT, fn: "getMode" },
+        { target: peerAddr, iface: NTT, fn: "token" },
+      ]), 10000, "dst");
+      if (mode == null || !dToken) return;
+      const [dDec] = await multicall(dp, [{ target: dToken, iface: ERC20, fn: "decimals" }]);
+      const probe = 10n ** BigInt(dDec != null ? Number(dDec) : (decimals ?? 18));
+      const d = await withTimeout(safeSimulateCredit(dp, {
+        token: dToken, spender: peerAddr, amount: probe, mode: Number(mode) === 1 ? "mint" : "release",
+      }), 15000, "sim");
+      row.delivery = { ...d, chain: whName(id) };
+      row.status = d.status;
+      row.note = `peer manager ${peerAddr.slice(0, 10)}… (${NTT_MODE_NAMES[Number(mode)] || mode})`;
+    } catch (e) {
+      row.delivery = { status: "unknown", chain: whName(id), note: e.message };
+    }
+    rows.push(row);
+  }));
+  return { rows, notes: [`NTT manager ${manager}`], legend: "← = how much can arrive here from that chain · → = whether that chain's manager can credit what we send" };
 }
+const NTT_MODE_NAMES = ["locking", "burning"];
 
 const WH_ID_BY_NAME = Object.fromEntries([
   ...Object.entries(WH_NAMES).map(([id, n]) => [n, Number(id)]),

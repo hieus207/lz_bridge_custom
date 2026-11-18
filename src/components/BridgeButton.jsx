@@ -1,3 +1,4 @@
+/* global BigInt */
 import { useState, useEffect, useMemo, useRef } from "react";
 import { PublicKey } from "@solana/web3.js";
 import { ethers } from "ethers";
@@ -12,6 +13,7 @@ import useCustomChains from "../hooks/useCustomChains";
 import { chainName, getRpcs } from "../lib/chains";
 import { getCustomChain, loadCustomChains, removeCustomChain, probeRpc } from "../lib/customChains";
 import { makeProvider } from "../lib/onchain";
+import { checkLzDelivery } from "../lib/bridgeLimits";
 
 // Verify an RPC really serves `chainId` (raw eth_chainId with timeout), then
 // build a provider pinned to it. ethers' own getNetwork() hangs on dead RPCs.
@@ -122,6 +124,7 @@ const BridgeButton = ({ signer, address, disconnect, wallet, onSelectSolana, onS
   };
   const [alert, setAlert] = useState(null);
   const [autoCheck, setAutoCheck] = useState(false);
+  const [skipDestCheck, setSkipDestCheck] = useState(false); // session-only escape hatch for the pre-flight
   const [balance, setBalance] = useState("0");
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [checking, setChecking] = useState(false);
@@ -640,6 +643,23 @@ const tryWithFallback = async (chainId, fn) => {
       const readOnlyContract = new ethers.Contract(oftAddress, oftAbi, provider);
       const contract = new ethers.Contract(oftAddress, oftAbi, txSigner);
       const recipient = await txSigner.getAddress();
+
+      // Pre-flight: will the destination actually credit this amount? A burn here succeeds even
+      // when the peer's minter allowance is 0 or its lockbox is empty — then the tokens are stuck.
+      if (!skipDestCheck) {
+        setAlert({ type: "info", message: "Checking the destination can credit this transfer…" });
+        const chk = await checkLzDelivery({
+          provider, oft: oftAddress, srcChainId: currentChainId, dstEid: Number(sendParams.dstEid),
+          amount: BigInt(sendParams.amountLD), recipient: toSolana ? null : recipient, decimals: info?.decimals ?? 18,
+        }).catch((e) => ({ status: "unknown", note: e?.shortMessage || e?.message || String(e) }));
+        if (chk.status === "blocked") {
+          setAlert({ type: "error", message: `Not sent: ${chk.chain || "destination"} ${chk.note}. The burn here would succeed and your tokens would be stuck there until the issuer fixes it. (Settings → "Skip destination check" to force.)` });
+          return;
+        }
+        setAlert(chk.status === "unknown"
+          ? { type: "info", message: `Destination credit not verified (${chk.note}). Sending anyway.` }
+          : { type: "info", message: `${chk.chain} can credit this transfer (${chk.mode === "release" ? "pays from its balance" : chk.mode === "internal" ? "mints internally" : "mint simulated"}). Sending…` });
+      }
 
       console.log(sendParams);
       try {
@@ -1580,6 +1600,17 @@ const tryWithFallback = async (chainId, fn) => {
               </button>
             </div>
             <div className="px-5 py-4 flex flex-col gap-4">
+              {/* Pre-flight simulation of the destination credit (mint / lockbox release) before every send */}
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-sm text-gray-600">Skip destination check<br /><span className="text-[11px] text-gray-400">Sends even if the peer cannot mint or release (EUROP-style stuck transfer)</span></span>
+                <button
+                  type="button"
+                  onClick={() => setSkipDestCheck((v) => !v)}
+                  className={`w-10 h-[22px] rounded-full transition-colors relative flex-shrink-0 ${skipDestCheck ? "bg-red-500" : "bg-gray-300"}`}
+                >
+                  <span className={`absolute top-[3px] w-4 h-4 bg-white rounded-full transition-all ${skipDestCheck ? "left-[21px]" : "left-[3px]"}`} />
+                </button>
+              </div>
               {/* Auto OFT Scanner on non-OFT contract */}
               <div className="flex items-center justify-between">
                 <span className="text-sm text-gray-600">Auto-scan OFT if not OFT contract</span>

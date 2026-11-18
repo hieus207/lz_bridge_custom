@@ -3,6 +3,7 @@ import { BrowserRouter as Router, Routes, Route, Navigate, useLocation } from "r
 import Bridge from "./pages/Bridge";
 import Solana from "./pages/Solana";
 import BridgeScan from "./pages/BridgeScan";
+import Gateway from "./pages/Gateway";
 import TopNav from "./components/shell/TopNav";
 import MarketBackground from "./components/shell/MarketBackground";
 
@@ -26,6 +27,7 @@ function App() {
         <Route path="/bridge" element={<Bridge />} />
         <Route path="/scan" element={<BridgeScan />} />
         <Route path="/solana" element={<Solana />} />
+        <Route path="/gateway" element={<Gateway />} />
         <Route path="/nexus" element={<NexusRedirect />} />
       </Routes>
     </Router>

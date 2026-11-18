@@ -6,6 +6,7 @@ import { LogOut, ChevronDown } from "lucide-react";
 import Alert from "./Alert";
 import useSolanaWallet from "../hooks/useSolanaWallet";
 import { CHAIN_LIST } from "../lib/chains";
+import { checkLzDeliveryFromSolana } from "../lib/bridgeLimits";
 import {
   SOLANA_RPCS, makeSolana, resolveSolanaOft, getPeers, getBalance, quoteSend, sendFromSolana, evmTo32,
 } from "../lib/solanaOft";
@@ -152,6 +153,14 @@ export default function SolanaOftBridge({ evmAddress, onSourceChange, onSummary 
     setSending(true);
     setAlert(null);
     try {
+      // Pre-flight: will the EVM peer actually credit this amount? (minter allowance / lockbox balance / paused)
+      setStatus("Checking the destination can credit this transfer…");
+      const chk = await checkLzDeliveryFromSolana({ sol, token, dstEid, amount: amountLd, recipient }).catch((e) => ({ status: "unknown", note: e.message }));
+      if (chk.status === "blocked") {
+        setAlert({ type: "error", message: `Not sent: ${chk.chain || "destination"} ${chk.note}. The burn here would succeed and the tokens would be stuck there until the issuer fixes it.` });
+        return;
+      }
+      if (chk.status === "unknown") setAlert({ type: "info", message: `Destination credit not verified (${chk.note}). Sending anyway.` });
       const { signature } = await sendFromSolana(sol, sw.signer, token, { dstEid, to: evmTo32(recipient), amountLd }, setStatus);
       setAlert({
         type: "success",

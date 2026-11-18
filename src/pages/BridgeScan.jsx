@@ -83,9 +83,10 @@ const LIMIT_STATUS = {
   ok: { label: "OK", cls: "text-[var(--up)] border-[var(--up)]" },
   low: { label: "Low", cls: "text-[var(--warn)] border-[var(--warn)]" },
   blocked: { label: "Blocked", cls: "text-white bg-[var(--down)] border-[var(--down)]" },
+  unknown: { label: "Unchecked", cls: "text-[var(--warn)] border-[var(--line-2)]" },
   unlimited: { label: "No limit", cls: "text-gray-400 border-[var(--line-2)]" },
 };
-const STATUS_RANK = { blocked: 3, low: 2, ok: 1, unlimited: 0 };
+const STATUS_RANK = { blocked: 4, low: 3, unknown: 2, ok: 1, unlimited: 0 };
 
 function StatusChip({ status }) {
   const s = LIMIT_STATUS[status] || LIMIT_STATUS.unlimited;
@@ -93,10 +94,46 @@ function StatusChip({ status }) {
 }
 
 // "available / capacity" for one direction
-function Amount({ available, capacity, decimals, usd }) {
+function Amount({ available, capacity, decimals, usd, held }) {
   if (usd) return <span className="tabular">{fmtUsd(available)} <span className="text-gray-400">/ {fmtUsd(capacity)}</span></span>;
-  if (capacity == null) return <span className="text-gray-400">no limit</span>;
-  return <span className="tabular">{fmtAmount(available, decimals)} <span className="text-gray-400">/ {fmtAmount(capacity, decimals)}</span></span>;
+  if (capacity == null) {
+    return held != null ? <span className="tabular">{fmtAmount(held, decimals)}</span> : <span className="text-gray-400">no limit</span>;
+  }
+  const now = held != null && held < available ? held : available;
+  return <span className="tabular">{fmtAmount(now, decimals)} <span className="text-gray-400">/ {fmtAmount(capacity, decimals)}</span></span>;
+}
+
+// What a lock/release pool can pay out; loud when a transfer could revert on arrival.
+function PoolLiquidity({ pool, decimals, dir }) {
+  if (!pool) return null;
+  if (pool.status === "unknown") {
+    return <div className="font-bold text-[var(--warn)]">⚠ Could not read {pool.chain} pool liquidity. Check it before bridging.</div>;
+  }
+  if (pool.status === "blocked" || pool.status === "low") {
+    const color = pool.status === "blocked" ? "text-[var(--down)]" : "text-[var(--warn)]";
+    return (
+      <div className={`font-bold ${color}`}>
+        ⚠ {dir}: {pool.chain} pool only holds {fmtAmount(pool.held, decimals)}. A bigger transfer fails on arrival and stays stuck until the pool is refilled.
+      </div>
+    );
+  }
+  return <div className="text-gray-500">{pool.chain} pool holds {fmtAmount(pool.held, decimals)} (max that can arrive)</div>;
+}
+
+// Simulated credit on the receiving side (mint from the adapter / release from a lockbox).
+// This is the EUROP case: the source burns fine, the destination's minter allowance is 0.
+function Delivery({ d, dir }) {
+  if (!d) return null;
+  const who = d.chain ? `${d.chain}` : "destination";
+  if (d.status === "blocked") {
+    return (
+      <div className="font-bold text-[var(--down)]">
+        ⛔ {dir}: {who} {d.note || "cannot credit arrivals"}. Tokens leave here but get stuck there.
+      </div>
+    );
+  }
+  if (d.status === "unknown") return <div className="text-[var(--warn)]">⚠ {dir}: {who} credit not verified ({d.note || "no simulation"})</div>;
+  return <div className="text-gray-500">✓ {dir}: {who} can credit ({d.mode === "release" ? "pays from its balance" : d.mode === "internal" ? "mints internally" : "mint simulated"})</div>;
 }
 
 const COLLAPSED_LIMIT_ROWS = 6;
@@ -154,13 +191,17 @@ function LimitsPanel({ kind, f, ctx }) {
                     {r.usd ? (
                       <Amount usd available={r.availableUsd} capacity={r.capacityUsd} />
                     ) : (
-                      <Amount available={r.available} capacity={r.capacity} decimals={dec} />
+                      <Amount available={r.available} capacity={r.capacity} decimals={dec} held={r.sendPool?.held} />
                     )}
                     {r.inbound && (
                       <div className="text-gray-500">
-                        in: <Amount available={r.inbound.available} capacity={r.inbound.capacity} decimals={dec} />
+                        in: <Amount available={r.inbound.available} capacity={r.inbound.capacity} decimals={dec} held={r.recvPool?.held} />
                       </div>
                     )}
+                    <PoolLiquidity pool={r.sendPool} decimals={dec} dir="Send" />
+                    <PoolLiquidity pool={r.recvPool} decimals={dec} dir="Receive" />
+                    <Delivery d={r.delivery} dir="Send" />
+                    <Delivery d={r.recvDelivery} dir="Receive" />
                     {r.maxTx != null && <div className="text-gray-500">max/tx {fmtAmount(r.maxTx, dec)}</div>}
                     {r.maxTxUsd != null && <div className="text-gray-500">&gt; {fmtUsd(r.maxTxUsd)}/tx waits 24h</div>}
                     {r.liquidity != null && <div className="text-gray-500" title="Tokens held by the destination adapter. A lockbox can only release this much; a mint/burn adapter is not limited by it.">dest adapter holds {fmtAmount(r.liquidity, dec)}</div>}
