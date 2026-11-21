@@ -94,7 +94,41 @@ const LZ = new ethers.Interface([
   "function paused() view returns (bool)",
   "function token() view returns (address)",
   "function approvalRequired() view returns (bool)",
+  "function endpoint() view returns (address)",
+  "function quoteSend((uint32 dstEid, bytes32 to, uint256 amountLD, uint256 minAmountLD, bytes extraOptions, bytes composeMsg, bytes oftCmd), bool payInLzToken) view returns ((uint256 nativeFee, uint256 lzTokenFee))",
 ]);
+// Endpoint V2: which message library a lane uses. The owner can point a lane at LayerZero's
+// BlockedMessageLib, whose every call reverts LZ_NotImplemented() — the lane is closed on purpose.
+const ENDPOINT = new ethers.Interface([
+  "function getSendLibrary(address sender, uint32 dstEid) view returns (address)",
+  "function getReceiveLibrary(address receiver, uint32 srcEid) view returns (address lib, bool isDefault)",
+  "function blockedLibrary() view returns (address)",
+]);
+const LZ_ERRORS = { "0x2657b6c3": "LZ_NotImplemented (message library blocked)", "0xf6ff4fb7": "NoPeer", "0x9a6d49cd": "InvalidOptions", "0x71c4efed": "SlippageExceeded", "0xa74c1c5f": "RateLimitExceeded", "0x9e87fac8": "Paused", "0xd93c0665": "EnforcedPause" };
+const lzErrorText = (err) => {
+  const d = err?.data ?? err?.info?.error?.data ?? err?.error?.data;
+  const hex = typeof d === "string" ? d : d?.data;
+  if (typeof hex === "string" && hex.length >= 10) return LZ_ERRORS[hex.slice(0, 10)] || `custom error ${hex.slice(0, 10)}`;
+  return (err?.shortMessage || err?.message || String(err)).slice(0, 80);
+};
+
+// Source side of one lane: send library + a real quoteSend. A blocked library or a reverting
+// quote means `send` reverts too, whatever the rate limits say.
+async function lzSendSide(provider, oft, endpointAddr, eid, decimals) {
+  const [lib, blocked] = endpointAddr ? await multicall(provider, [
+    { target: endpointAddr, iface: ENDPOINT, fn: "getSendLibrary", args: [oft, eid] },
+    { target: endpointAddr, iface: ENDPOINT, fn: "blockedLibrary" },
+  ]) : [null, null];
+  if (lib && blocked && lc(lib) === lc(blocked)) return { status: "blocked", note: "Send library is LayerZero's BlockedMessageLib: the OFT owner closed this lane (send reverts LZ_NotImplemented)" };
+  const params = [eid, ethers.zeroPadValue("0x000000000000000000000000000000000000dEaD", 32), 10n ** BigInt(decimals ?? 18), 0n, "0x", "0x", "0x"];
+  try {
+    await provider.call({ to: oft, data: LZ.encodeFunctionData("quoteSend", [params, false]) });
+    return { status: "ok" };
+  } catch (err) {
+    if (err?.code !== "CALL_EXCEPTION") return { status: "unknown", note: `quoteSend not checked: ${lzErrorText(err)}` };
+    return { status: "blocked", note: `quoteSend reverts: ${lzErrorText(err)} — send would revert the same way` };
+  }
+}
 
 // LayerZero RateLimiter: in-flight amount decays linearly over the window.
 function lzAvailable(rl, now) {
@@ -141,12 +175,23 @@ async function lzDestSide({ key, peer32, srcEid, decimals, now, amount, recipien
   const dp = await withTimeout(providerFor(dstId), 10000, "rpc");
   if (!dp) return null;
   const peerAddr = ethers.getAddress("0x" + peer32.slice(26));
-  const [inRl, inner, approval, paused] = await withTimeout(multicall(dp, [
+  const [inRl, inner, approval, paused, dEndpoint] = await withTimeout(multicall(dp, [
     { target: peerAddr, iface: LZ, fn: "inboundRateLimits", args: [srcEid || 0] },
     { target: peerAddr, iface: LZ, fn: "token" },
     { target: peerAddr, iface: LZ, fn: "approvalRequired" },
     { target: peerAddr, iface: LZ, fn: "paused" },
+    { target: peerAddr, iface: LZ, fn: "endpoint" },
   ]), 10000, "dst");
+  // Receive library for messages from the source: BlockedMessageLib = nothing can be verified/delivered
+  let receiveBlocked = false;
+  if (dEndpoint && srcEid) {
+    const [rl, bl] = await withTimeout(multicall(dp, [
+      { target: dEndpoint, iface: ENDPOINT, fn: "getReceiveLibrary", args: [peerAddr, srcEid] },
+      { target: dEndpoint, iface: ENDPOINT, fn: "blockedLibrary" },
+    ]), 10000, "dst").catch(() => [null, null]);
+    const rlAddr = rl?.[0] ?? rl?.lib;
+    receiveBlocked = !!rlAddr && !!bl && lc(rlAddr) === lc(bl);
+  }
   const tokenAddr = inner || peerAddr;
   const external = !!inner && lc(inner) !== lc(peerAddr);
   const [dDec, bal] = await withTimeout(multicall(dp, [
@@ -157,7 +202,8 @@ async function lzDestSide({ key, peer32, srcEid, decimals, now, amount, recipien
   const inLim = srcEid ? lzAvailable(inRl, now) : null;
   // The credit the destination OFT performs on arrival, simulated from its own address
   let delivery;
-  if (paused === true) delivery = { status: "blocked", note: "destination OFT paused" };
+  if (receiveBlocked) delivery = { status: "blocked", note: "receive library for this source is BlockedMessageLib: the owner closed the lane, nothing from here gets delivered" };
+  else if (paused === true) delivery = { status: "blocked", note: "destination OFT paused" };
   else if (!external) delivery = { status: "ok", mode: "internal", note: "token is the OFT itself: it mints internally" };
   else {
     const probe = amount != null ? scaleDec(amount, decimals, dd) : 10n ** BigInt(dd);
@@ -196,8 +242,13 @@ export async function checkLzDelivery({ provider, oft, srcChainId, dstEid, amoun
   const { byKey, byEid } = await loadLzEids();
   const key = byEid.get(Number(dstEid));
   if (!key) return { status: "unknown", chain: `eid ${dstEid}`, note: "destination eid not in LayerZero's registry" };
-  const [peer32] = await multicall(provider, [{ target: oft, iface: LZ, fn: "peers", args: [dstEid] }]);
+  const [peer32, endpointAddr] = await multicall(provider, [
+    { target: oft, iface: LZ, fn: "peers", args: [dstEid] },
+    { target: oft, iface: LZ, fn: "endpoint" },
+  ]);
   if (!peer32 || peer32 === ZERO32) return { status: "blocked", chain: lzChainLabel(key), note: "this OFT has no peer on that chain" };
+  const send = await lzSendSide(provider, oft, endpointAddr, Number(dstEid), decimals).catch(() => null);
+  if (send?.status === "blocked") return { status: "blocked", chain: lzChainLabel(key), note: `lane closed on this side — ${send.note}` };
   const srcEid = CHAINS[srcChainId]?.lzKey ? byKey.get(CHAINS[srcChainId].lzKey) : null;
   return destVerdict(await withTimeout(lzDestSide({
     key, peer32, srcEid, decimals, now: Math.floor(Date.now() / 1000), amount, recipient,
@@ -243,9 +294,10 @@ async function lzLimits({ address, chainId, provider, decimals, rpcUrl }) {
     target: address, iface: LZ, fn,
     args: fn === "quoteOFT" ? [[r.eid, ethers.zeroPadValue("0x000000000000000000000000000000000000dEaD", 32), one, 0n, "0x", "0x", "0x"]] : [r.eid],
   })));
-  calls.push({ target: address, iface: LZ, fn: "paused" });
+  calls.push({ target: address, iface: LZ, fn: "paused" }, { target: address, iface: LZ, fn: "endpoint" });
   const res = await multicall(provider, calls);
-  const paused = res[res.length - 1];
+  const endpointAddr = res[res.length - 1];
+  const paused = res[res.length - 2];
 
   const rows = await Promise.all(routes.map(async (r, i) => {
     const [canSend, rl, outRl, quote] = res.slice(i * perRoute.length, (i + 1) * perRoute.length);
@@ -261,7 +313,12 @@ async function lzLimits({ address, chainId, provider, decimals, rpcUrl }) {
     if (maxTx != null && maxTx !== UINT64_MAX && maxTx !== UINT256_MAX) row.maxTx = maxTx;
     row.status = paused === true ? "blocked" : statusOf(row.available, row.capacity, decimals);
     if (paused === true) row.note = "OFT paused";
-    if (srcEid) await attachDest(row, { key, peer32: r.peer, srcEid, decimals, now });
+    const send = await withTimeout(lzSendSide(provider, address, endpointAddr, r.eid, decimals), 15000, "send").catch(() => null);
+    if (send && send.status !== "ok") {
+      row.status = worse(row.status, send.status);
+      row.note = [row.note, send.note].filter(Boolean).join(" · ");
+    }
+    if (send?.status !== "blocked" && srcEid) await attachDest(row, { key, peer32: r.peer, srcEid, decimals, now });
     return row;
   }));
 
