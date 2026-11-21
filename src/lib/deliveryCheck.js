@@ -58,8 +58,10 @@ async function tryCall(provider, tx) {
   try { await provider.call(tx); return { ok: true }; } catch (err) { return { ok: false, err }; }
 }
 
-// mode: "mint" (adapter mints) | "release" (adapter pays from its balance) | "auto"
-// auto = mint first; a mint that reverts with no data (no mint() at all) falls back to release.
+// mode: "mint" (adapter must mint) | "release" (expected to pay from its balance) | "auto".
+// An adapter's self-description is not trusted: CYBER's Optimism OFT says approvalRequired()
+// yet mints, so for "release"/"auto" both paths are tried and either passing means deliverable.
+// Only "mint" (burn/mint pools and managers) is strict. The note leads with the expected path.
 export async function simulateCredit(provider, { token, spender, recipient, amount, mode = "auto" }) {
   const to = recipient || PROBE_RECIPIENT;
   const amt = BigInt(amount);
@@ -67,19 +69,14 @@ export async function simulateCredit(provider, { token, spender, recipient, amou
   const release = () => tryCall(provider, { to: token, from: spender, data: CREDIT.encodeFunctionData("transfer", [to, amt]) });
   // A plain `require` (USDT-style) reverts with no data: for a payout that means "not enough held"
   const releaseNote = (err) => (hasRevertData(err) ? revertReason(err) : "adapter does not hold enough to pay this out");
-  if (mode === "release") {
-    const r = await release();
-    return r.ok ? { status: "ok", mode: "release" } : { status: "blocked", mode: "release", note: `cannot release: ${releaseNote(r.err)}` };
-  }
   const m = await mint();
   if (m.ok) return { status: "ok", mode: "mint" };
-  if (mode === "mint" || hasRevertData(m.err)) {
-    return { status: "blocked", mode: "mint", note: `cannot mint: ${revertReason(m.err)}` };
-  }
-  // No mint() on this token: it must be a lockbox paying out of its balance
+  if (mode === "mint") return { status: "blocked", mode: "mint", note: `cannot mint: ${revertReason(m.err)}` };
   const r = await release();
   if (r.ok) return { status: "ok", mode: "release" };
-  return { status: "blocked", mode: "release", note: `cannot mint (${revertReason(m.err)}) nor release: ${releaseNote(r.err)}` };
+  return mode === "release"
+    ? { status: "blocked", mode: "release", note: `cannot release: ${releaseNote(r.err)} (mint: ${revertReason(m.err)})` }
+    : { status: "blocked", mode: "mint", note: `cannot mint: ${revertReason(m.err)} (release: ${releaseNote(r.err)})` };
 }
 
 // RPC trouble (not a revert) → unknown, never a false "blocked"
